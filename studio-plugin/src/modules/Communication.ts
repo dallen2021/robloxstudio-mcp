@@ -311,25 +311,10 @@ function deactivateAll() {
 }
 
 function checkForUpdates() {
-	task.spawn(() => {
-		const [success, result] = pcall(() => {
-			return HttpService.RequestAsync({
-				Url: "https://registry.npmjs.org/@chrrxs/robloxstudio-mcp/latest",
-				Method: "GET",
-				Headers: { Accept: "application/json" },
-			});
-		});
-
-		if (success && result.Success) {
-			const [ok, data] = pcall(() => HttpService.JSONDecode(result.Body) as { version?: string });
-			if (ok && data?.version) {
-				const latestVersion = data.version;
-				if (Utils.compareVersions(State.CURRENT_VERSION, latestVersion) < 0) {
-					UI.showBanner("update", `v${latestVersion} available - github.com/chrrxs/robloxstudio-mcp`);
-				}
-			}
-		}
-	});
+	// dallen fork: no update check. The plugin and server are built together from
+	// the fork at one pinned version (e.g. 3.2.1-dallen.1); upstream's npm "latest"
+	// would always look newer and point at a plugin that fails the /ready version
+	// match. It also keeps the plugin from making any request outside localhost.
 }
 
 export = {
