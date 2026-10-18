@@ -1,3 +1,5 @@
+> **dallen fork (3.2.1-dallen.1):** per-agent place pinning, token-gated `/health`, macOS close refusal, read-only DataStore tools, local-only version-pinned plugin install. See [docs/fork-notes.md](docs/fork-notes.md) for what changed, install, pinning and upstream sync.
+
 # Roblox Studio MCP
 
 Connect your coding agent directly to Roblox Studio. It can edit places, run Luau
