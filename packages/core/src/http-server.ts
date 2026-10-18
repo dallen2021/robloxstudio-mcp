@@ -306,6 +306,10 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   }, body.instance_id),
   breakpoints: (tools, body) => tools.breakpoints(body.action, body, body.target, body.instance_id),
   get_connected_instances: (tools) => tools.getConnectedInstances(),
+  read_datastore: (tools, body) => tools.readDatastore(body.universeId, body.datastoreName, body.key, body.scope),
+  list_datastore_keys: (tools, body) => tools.listDatastoreKeys(body.universeId, body.datastoreName, body.scope, body.prefix, body.limit, body.cursor),
+  // pin_place is per stdio process (server.ts handles it before this table); over HTTP it is a no-op error.
+  pin_place: async () => { throw new Error('pin_place only applies to a stdio session (set ROBLOX_STUDIO_PLACE on that process)'); },
   search_assets: (tools, body) => tools.searchAssets(body.assetType, body.query, body.maxResults, body.sortBy, body.robloxCreatedOnly),
   get_asset_details: (tools, body) => tools.getAssetDetails(body.assetId),
   get_asset_thumbnail: (tools, body) => tools.getAssetThumbnail(body.assetId, body.size),
@@ -576,10 +580,46 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
   app.use(handleBodySizeError);
 
 
+  // dallen fork: /health stays tokenless for liveness, but place names, instance
+  // ids and peers are only listed for callers presenting the shared token (or
+  // when ROBLOX_STUDIO_PUBLIC_HEALTH=1 restores upstream behaviour).
+  const publicHealth = ['1', 'true', 'yes'].includes((process.env.ROBLOX_STUDIO_PUBLIC_HEALTH ?? '').trim().toLowerCase());
+  const healthDetailAllowed = (req: express.Request): boolean => {
+    if (!authToken || publicHealth) return true;
+    const headerToken = req.headers['x-mcp-auth'];
+    const bearer = typeof req.headers.authorization === 'string' && req.headers.authorization.startsWith('Bearer ')
+      ? req.headers.authorization.slice('Bearer '.length)
+      : undefined;
+    const provided = typeof headerToken === 'string' && headerToken !== '' ? headerToken : bearer;
+    return provided !== undefined && tokensMatch(provided, authToken);
+  };
+
   app.get('/health', (req, res) => {
     const peers = bridge.getPublicPeers().map(toPassivePeer);
     const instances = bridge.getPublicInstances().map(toPassiveInstance);
     const multiplayerGroups = bridge.getPublicMultiplayerGroups();
+    if (!healthDetailAllowed(req)) {
+      res.json({
+        status: 'ok',
+        service: 'robloxstudio-mcp',
+        serverName: serverConfig?.name ?? 'robloxstudio-mcp',
+        version: serverConfig?.version,
+        serverVersion: serverConfig?.version,
+        capabilities: studioLifecycleCallable ? {
+          studioLifecycle: {
+            protocolVersion: 3,
+            endpoint: '/mcp/manage_instance',
+            hostPlatform: studioLifecycleCapabilities?.hostPlatform,
+          },
+        } : {},
+        pluginConnected: peers.length > 0,
+        instanceCount: instances.length,
+        peerCount: peers.length,
+        mcpServerActive: isMCPServerActive(),
+        detail: 'redacted: send X-MCP-Auth for instances and peers',
+      });
+      return;
+    }
     res.json({
       status: 'ok',
       service: 'robloxstudio-mcp',

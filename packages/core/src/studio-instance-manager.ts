@@ -219,6 +219,18 @@ export type ManagedStudioCloseResult =
   | { status: 'already_closed'; launchId?: string; instanceId?: string }
   | { status: 'not_found'; launchId?: string; instanceId?: string };
 
+/** dallen fork: manage_instance close is not supported for macOS Studio processes. */
+export class MacStudioCloseUnsupportedError extends Error {
+  readonly code = 'close_unsupported_on_macos';
+  constructor(readonly processId: number) {
+    super(
+      `manage_instance close is not supported on macOS: Studio ignores SIGTERM, so process ${processId} was left running untouched. ` +
+      'Close it with tools/studio-background/studio.sh close <place> (or studio.sh discard <place> for a disposable QA copy).',
+    );
+    this.name = 'MacStudioCloseUnsupportedError';
+  }
+}
+
 class StudioCloseVerificationError extends Error {
   constructor(message: string, readonly observation: ManagedProcessObservation) {
     super(message);
@@ -2282,6 +2294,11 @@ export class StudioInstanceManager {
           throw new Error('Cannot stop a Wine Studio process without its creation-time identity.');
         }
         await stopWineStudio(processId, startedAt, Math.max(1, deadline - Date.now()));
+      } else if (process.platform === 'darwin') {
+        // dallen fork: macOS Studio ignores SIGTERM (verified Studio 0.743), so the
+        // upstream close always timed out and left the process running. Refuse
+        // before signalling anything; the caller closes with its own tooling.
+        throw new MacStudioCloseUnsupportedError(processId);
       } else {
         try {
           process.kill(processId, 'SIGTERM');

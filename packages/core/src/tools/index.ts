@@ -4254,6 +4254,23 @@ export class RobloxStudioTools {
   }
 
 
+  // === DataStore (Open Cloud, read-only; dallen fork) ===
+
+  async readDatastore(universeId: number, datastoreName: string, key: string, scope?: string) {
+    if (!Number.isInteger(universeId) || universeId <= 0) throw new Error('universeId must be a positive integer');
+    if (!datastoreName || !key) throw new Error('datastoreName and key are required');
+    const value = await this.openCloudClient.readDatastoreEntry(universeId, datastoreName, key, scope || 'global');
+    return this._textResult({ universeId, datastoreName, key, scope: scope || 'global', value });
+  }
+
+  async listDatastoreKeys(universeId: number, datastoreName: string, scope?: string, prefix?: string, limit?: number, cursor?: string) {
+    if (!Number.isInteger(universeId) || universeId <= 0) throw new Error('universeId must be a positive integer');
+    if (!datastoreName) throw new Error('datastoreName is required');
+    const clamped = Math.min(Math.max(Math.trunc(limit ?? 100), 1), 100);
+    const page = await this.openCloudClient.listDatastoreKeys(universeId, datastoreName, scope || 'global', prefix, clamped, cursor);
+    return this._textResult({ universeId, datastoreName, scope: scope || 'global', page });
+  }
+
   // === Asset Tools ===
 
   async searchAssets(

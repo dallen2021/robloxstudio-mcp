@@ -9,6 +9,7 @@ import { ProxyBridgeService } from './proxy-bridge-service.js';
 import type { ToolDefinition } from './tools/definitions.js';
 import { createToolServer } from './mcp-runtime.js';
 import { BoundedStdioTransport } from './stdio-transport.js';
+import { PlacePinGuard } from './place-pin.js';
 
 export interface ServerConfig {
   name: string;
@@ -21,10 +22,12 @@ export class RobloxStudioMCPServer {
   private bridge: BridgeService;
   private allowedToolNames: Set<string>;
   private config: ServerConfig;
+  private pinGuard: PlacePinGuard;
 
   constructor(config: ServerConfig) {
     this.config = config;
     this.allowedToolNames = new Set(config.tools.map(t => t.name));
+    this.pinGuard = new PlacePinGuard(config.tools);
 
     this.bridge = new BridgeService();
     this.tools = new RobloxStudioTools(this.bridge);
@@ -153,9 +156,21 @@ export class RobloxStudioMCPServer {
         allowedTools: this.allowedToolNames,
         era: context.era,
         invoke: async (tools, name, args, invocation) => {
+          // Per-agent place pin (dallen fork): this stdio process may only reach
+          // its pinned places. See place-pin.ts.
+          if (name === 'pin_place') {
+            this.pinGuard.setPin(args.places);
+            return pinGuardResult(this.pinGuard.describe(), this.pinGuard.filterConnectedInstances(this.bridge));
+          }
+          if (name === 'get_connected_instances' && this.pinGuard.pinState.kind !== 'open') {
+            const refresh = this.bridge.refreshTopologyForRouting(invocation.signal);
+            if (refresh) await refresh;
+            return pinGuardResult(undefined, this.pinGuard.filterConnectedInstances(this.bridge));
+          }
+          const checked = await this.pinGuard.check(this.bridge, name, args);
           const handler = TOOL_HANDLERS[name];
           if (!handler) throw new Error(`Unknown tool: ${name}`);
-          return handler(tools, args, invocation);
+          return handler(tools, checked, invocation);
         },
       }),
       {
@@ -164,6 +179,10 @@ export class RobloxStudioMCPServer {
       },
     );
     console.error(`${this.config.name} v${this.config.version} running on stdio`);
+    const pin = this.pinGuard.pinState;
+    console.error(pin.kind === 'pinned'
+      ? `Place pin: ${pin.keys.join(', ')}`
+      : pin.kind === 'locked' ? 'Place pin required (ROBLOX_STUDIO_REQUIRE_PIN=1): no place is reachable until pin_place' : 'No place pin (all open places reachable)');
 
     if (primaryApp) {
       primaryApp.setMCPServerActive(true);
@@ -223,4 +242,8 @@ export class RobloxStudioMCPServer {
     process.stdin.on('end', shutdown);
     process.stdin.on('close', shutdown);
   }
+}
+
+function pinGuardResult(pin: Record<string, unknown> | undefined, body: Record<string, unknown>) {
+  return { content: [{ type: 'text', text: JSON.stringify(pin ? { pin, ...body } : body) }] };
 }

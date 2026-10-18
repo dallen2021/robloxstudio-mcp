@@ -455,6 +455,27 @@ export class OpenCloudClient {
     });
   }
 
+  // dallen fork: read-only Standard DataStore access, ported from roblox-studio-mcp 0.3.
+  // Writes and deletes are deliberately not exposed (live player data).
+  async readDatastoreEntry(universeId: number, datastoreName: string, key: string, scope = 'global'): Promise<unknown> {
+    return this.request<unknown>(`/datastores/v1/universes/${universeId}/standard-datastores/datastore/entries/entry`, {
+      params: { datastoreName, entryKey: key, scope },
+    });
+  }
+
+  async listDatastoreKeys(
+    universeId: number,
+    datastoreName: string,
+    scope = 'global',
+    prefix?: string,
+    limit = 100,
+    cursor?: string,
+  ): Promise<unknown> {
+    return this.request<unknown>(`/datastores/v1/universes/${universeId}/standard-datastores/datastore/entries`, {
+      params: { datastoreName, scope, prefix, limit, cursor },
+    });
+  }
+
   async listAssetVersions(
     assetId: number | string,
     maxPageSize = 10,

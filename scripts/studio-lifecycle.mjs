@@ -689,9 +689,22 @@ export async function launchStudio(args = [], { workingDirectory, env = process.
   });
 }
 
+// The dallen fork redacts /health instances for tokenless callers; send the shared token.
+function healthHeaders() {
+  let token = process.env.ROBLOX_STUDIO_AUTH_TOKEN?.trim();
+  if (!token) {
+    try {
+      token = readFileSync(path.join(os.homedir(), '.robloxstudio-mcp', 'auth-token'), 'utf8').trim();
+    } catch {
+      token = undefined;
+    }
+  }
+  return token ? { 'X-MCP-Auth': token } : {};
+}
+
 function readHealth(port = DEFAULT_MCP_PORT) {
   return new Promise((resolve, reject) => {
-    const req = http.get(`http://127.0.0.1:${port}/health`, (res) => {
+    const req = http.get(`http://127.0.0.1:${port}/health`, { headers: healthHeaders() }, (res) => {
       const chunks = [];
       res.on('data', (chunk) => chunks.push(chunk));
       res.on('end', () => {

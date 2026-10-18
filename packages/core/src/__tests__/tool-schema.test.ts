@@ -224,6 +224,10 @@ describe('Tool schema compatibility', () => {
     'manage_instance',
     'get_roblox_docs',
     'get_roblox_skills',
+    // dallen fork additions: per-session pin and Open Cloud DataStore reads.
+    'pin_place',
+    'read_datastore',
+    'list_datastore_keys',
   ]);
 
   function toolHandlerBody(toolName: string): string {

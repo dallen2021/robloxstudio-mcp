@@ -293,12 +293,12 @@ describe('MCP v2 tool runtime', () => {
     const serialized = JSON.stringify(catalog);
     const inspectorCatalog = getReadOnlyTools().map(publicToolDefinition);
 
-    expect(catalog).toHaveLength(49);
-    expect(serialized.length).toBeLessThanOrEqual(46_500);
-    expect(catalog.filter((tool) => tool.outputSchema)).toHaveLength(48);
+    expect(catalog).toHaveLength(52); // dallen fork: +pin_place, read_datastore, list_datastore_keys
+    expect(serialized.length).toBeLessThanOrEqual(48_500);
+    expect(catalog.filter((tool) => tool.outputSchema)).toHaveLength(51);
     expect(catalog.every((tool) => tool.description.length <= 120)).toBe(true);
-    expect(inspectorCatalog).toHaveLength(25);
-    expect(JSON.stringify(inspectorCatalog).length).toBeLessThanOrEqual(21_000);
+    expect(inspectorCatalog).toHaveLength(28);
+    expect(JSON.stringify(inspectorCatalog).length).toBeLessThanOrEqual(22_500); // dallen fork tools
     expect(byName.get('selection')?.outputSchema).toEqual({
       type: 'object',
       additionalProperties: true,

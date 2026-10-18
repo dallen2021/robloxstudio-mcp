@@ -1229,7 +1229,58 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     }
   },
 
+  // === DataStore (Open Cloud, read-only; dallen fork) ===
+  {
+    name: 'read_datastore',
+    category: 'read',
+    description: 'Use to read one Standard DataStore entry through Open Cloud (needs ROBLOX_OPEN_CLOUD_API_KEY).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        universeId: { type: 'number', description: 'Universe ID.' },
+        datastoreName: { type: 'string', description: 'DataStore name.' },
+        key: { type: 'string', description: 'Entry key.' },
+        scope: { type: 'string', description: 'Scope; default global.' }
+      },
+      required: ['universeId', 'datastoreName', 'key']
+    }
+  },
+  {
+    name: 'list_datastore_keys',
+    category: 'read',
+    description: 'Use to list Standard DataStore keys through Open Cloud (needs ROBLOX_OPEN_CLOUD_API_KEY).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        universeId: { type: 'number', description: 'Universe ID.' },
+        datastoreName: { type: 'string', description: 'DataStore name.' },
+        scope: { type: 'string', description: 'Scope; default global.' },
+        prefix: { type: 'string', description: 'Key prefix filter.' },
+        limit: { type: 'number', description: 'Max keys, 1-100; default 100.' },
+        cursor: { type: 'string', description: 'Pagination cursor.' }
+      },
+      required: ['universeId', 'datastoreName']
+    }
+  },
+
   // === Multi-Instance ===
+  {
+    name: 'pin_place',
+    category: 'read',
+    description: 'Use first in a shared workspace: limit this agent to its own places (file name, Prefix*, or place id).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        places: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 1,
+          description: 'Place keys: exact file name, Prefix* or numeric place id.'
+        }
+      },
+      required: ['places']
+    }
+  },
   {
     name: 'get_connected_instances',
     category: 'read',

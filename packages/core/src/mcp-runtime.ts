@@ -9,6 +9,7 @@ import {
 } from '@modelcontextprotocol/server';
 import { MultiplayerGroupInUseError, RequestFailure, RoutingFailure } from './bridge-service.js';
 import { registerResourceHandlers } from './mcp-compat.js';
+import { PinViolationError } from './place-pin.js';
 import { StudioLaunchPreDispatchError } from './studio-instance-manager.js';
 import type { RobloxStudioTools } from './tools/index.js';
 import type { ToolDefinition } from './tools/definitions.js';
@@ -214,6 +215,7 @@ export function publicToolErrorBody(name: string, error: unknown): Record<string
   if (error instanceof StudioLaunchPreDispatchError) {
     return compactPublicEnvelope(error.toResponseBody());
   }
+  if (error instanceof PinViolationError) return { error: error.code, message: error.message, pin: [...error.pin] };
   if (error instanceof RoutingFailure) return publicRoutingError(error);
   if (error instanceof RequestFailure) {
     return { error: error.code, message: error.message.slice(0, 500), ...error.details };

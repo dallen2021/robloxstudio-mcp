@@ -57,3 +57,4 @@ export type {
 } from './opencloud-client.js';
 export { createPluginInstaller } from './plugin-installer.js';
 export type { PluginInstallOptions } from './plugin-installer.js';
+export { PlacePinGuard, PinViolationError, parsePinKeys, keyMatchesPlace } from './place-pin.js';

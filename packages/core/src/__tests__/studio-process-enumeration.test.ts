@@ -290,7 +290,9 @@ describe('native Studio process enumeration', () => {
   });
 });
 
-describe('native macOS close verification', () => {
+// dallen fork: macOS close now refuses before signalling (Studio ignores SIGTERM);
+// see place-pin.test.ts 'macOS manage_instance close'. Upstream's SIGTERM path is skipped.
+describe.skip('native macOS close verification', () => {
   let registryDir: string;
   let manager: StudioInstanceManager;
   let record: ManagedStudioInstance;
