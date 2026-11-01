@@ -1,8 +1,9 @@
-import { BridgeService, isRequestStage, isValidOperationId, MultiplayerGroupInUseError, parseFailureDetails, parseObservations, RequestFailure, toPublicPeer } from './bridge-service.js';
+import { BridgeService, isRequestStage, isValidOperationId, MultiplayerGroupInUseError, parseFailureDetails, parseObservations, PRIMARY_PROXY_FEATURES, RequestFailure, requiresAtomicProperties, requiresScriptPreconditions, toPublicPeer } from './bridge-service.js';
 import type {
   MultiplayerGroup,
   PublicStudioPeer,
   RequestFailureDetails,
+  PrimaryProxyFeature,
   RequestStatus,
   StudioInstance,
   StudioPeer,
@@ -63,6 +64,15 @@ function peerPublicationChanged(previous: StudioPeer | undefined, current: Studi
     || previous.serverVersion !== current.serverVersion;
 }
 
+function parsePrimaryFeatures(value: unknown): Set<PrimaryProxyFeature> {
+  const features = new Set<PrimaryProxyFeature>();
+  if (!Array.isArray(value)) return features;
+  for (const feature of PRIMARY_PROXY_FEATURES) {
+    if (value.includes(feature)) features.add(feature);
+  }
+  return features;
+}
+
 
 export class ProxyBridgeService extends BridgeService {
   private primaryBaseUrl: string;
@@ -78,6 +88,10 @@ export class ProxyBridgeService extends BridgeService {
   private static TOPOLOGY_TIMEOUT_MS = 2_000;
   private topologyGeneration = 0;
   private appliedTopologyGeneration = 0;
+  // Features of the primary's proxy protocol, from its latest topology. A
+  // primary that predates them advertises none and ignores their fields.
+  private primaryFeatures = new Set<PrimaryProxyFeature>();
+  private primaryVersion?: string;
 
   constructor(primaryBaseUrl: string, authToken?: string) {
     super();
@@ -105,6 +119,12 @@ export class ProxyBridgeService extends BridgeService {
 
   override refreshTopologyForRouting(signal?: AbortSignal): Promise<void> {
     return this.refreshTopology(signal, true);
+  }
+
+  // Known from the primary's latest topology; a primary that predates a
+  // feature, or has not been reached yet, lists none.
+  override supportsPrimaryFeature(feature: PrimaryProxyFeature): boolean {
+    return this.primaryFeatures.has(feature);
   }
 
   private async refreshTopology(signal?: AbortSignal, requireFresh = false): Promise<void> {
@@ -142,6 +162,8 @@ export class ProxyBridgeService extends BridgeService {
       this.cachedPeers = body.peers;
       this.cachedInstances = body.instances;
       this.cachedMultiplayerGroups = body.multiplayerGroups;
+      this.primaryFeatures = parsePrimaryFeatures('proxyFeatures' in body ? body.proxyFeatures : undefined);
+      this.primaryVersion = 'serverVersion' in body && typeof body.serverVersion === 'string' ? body.serverVersion : undefined;
       for (const peer of body.peers) {
         if (peerPublicationChanged(previousPeers.get(peer.peerId), peer)) {
           this.notifyPeerRegistered(toPublicPeer(peer));
@@ -308,9 +330,20 @@ export class ProxyBridgeService extends BridgeService {
     this.refreshTimer = undefined;
   }
 
+  // Names the primary in errors for proxy features it predates.
+  private primaryDescription(): string {
+    return `The primary MCP server at ${this.primaryBaseUrl}${this.primaryVersion ? ` (v${this.primaryVersion})` : ''}`;
+  }
+
   override async getRequestStatusEverywhere(requestId: string, waitMs = 0, signal?: AbortSignal): Promise<RequestStatus | undefined> {
     const query = new URLSearchParams({ requestId });
-    if (waitMs > 0) query.set('waitMs', String(waitMs));
+    if (waitMs > 0) {
+      await this.initialRefresh;
+      if (!this.primaryFeatures.has('status_wait')) {
+        throw new Error(`${this.primaryDescription()} cannot wait for an operation; call get_request_status without wait_ms, or restart that server on this version.`);
+      }
+      query.set('waitMs', String(waitMs));
+    }
     // The primary owns the wait; leave room for its answer to travel back.
     const timeout = AbortSignal.timeout(Math.max(0, waitMs) + PROXY_RESPONSE_GRACE_MS);
     const response = await fetch(`${this.primaryBaseUrl}/request-status?${query}`, {
@@ -324,6 +357,36 @@ export class ProxyBridgeService extends BridgeService {
     const status = parseRequestStatus(body.status);
     if (status.requestId !== requestId) throw new Error('Proxy returned status for a different request');
     return status;
+  }
+
+  // The primary owns operation records and does not expose their identity, so
+  // a proxy can only confirm that an operation ID is still unused. An existing
+  // one is refused rather than matched by repeating the costly preparation.
+  override async joinOperation(_endpoint: string, targetPeerId: string, operationId: string): Promise<undefined> {
+    await this.initialRefresh;
+    if (!this.primaryFeatures.has('identity')) {
+      // Its retries would be matched by payload, which a fresh upload changes.
+      throw new RequestFailure(
+        `${this.primaryDescription()} cannot match a retry of operation ${operationId} to its first attempt; call without operation_id, or restart that server on this version; queued; not_executed`,
+        'primary_unsupported', { requestId: operationId, targetPeerId, stage: 'queued', outcome: 'not_executed', executionOutcome: 'not_executed' },
+      );
+    }
+    const status = await this.getRequestStatusEverywhere(operationId);
+    if (!status) return undefined;
+    const details: RequestFailureDetails = {
+      requestId: operationId, targetPeerId: status.targetPeerId, stage: status.stage,
+      outcome: status.outcome === 'not_executed' ? 'not_executed' : 'unknown',
+    };
+    if (status.targetPeerId !== targetPeerId) {
+      throw new RequestFailure(
+        `Request ${operationId} already identifies a different operation; existing operation ${status.stage}; not replayed`,
+        'operation_id_collision', details,
+      );
+    }
+    throw new RequestFailure(
+      `${this.primaryDescription()} already holds request ${operationId}. This server did not prepare it and cannot confirm the arguments match without repeating the preparation; use get_request_status, or retry with a new operation_id; not replayed`,
+      'operation_unverifiable', details,
+    );
   }
 
   override async sendRequest(
@@ -363,13 +426,50 @@ export class ProxyBridgeService extends BridgeService {
     },
     signal?: AbortSignal,
   ): Promise<unknown> {
-    const { endpoint, data, targetPeerId, identity, submit } = request;
+    const { endpoint, data, targetPeerId, submit } = request;
+    let { identity } = request;
     const requestId = request.operationId ?? randomUUID();
     const details: RequestFailureDetails = { requestId, targetPeerId, stage: 'queued', outcome: 'not_executed', executionOutcome: 'not_executed' };
     if (!isValidOperationId(requestId)) {
       throw new RequestFailure('operationId must be a nonempty string of at most 128 characters', 'invalid_operation_id', details);
     }
     if (signal?.aborted) throw new RequestFailure(`Request aborted: ${requestId}; queued; not_executed`, 'request_aborted', details);
+    if (submit && !this.primaryFeatures.has('submit')) {
+      throw new RequestFailure(
+        `${this.primaryDescription()} cannot start a job that outlives the call; call without async, or restart that server on this version; queued; not_executed`,
+        'primary_unsupported', details,
+      );
+    }
+    if (identity !== undefined && !this.primaryFeatures.has('identity')) {
+      // That primary identifies an operation by its payload. Without a caller
+      // operation ID nothing is retried by identity, so the payload suffices.
+      if (request.operationId !== undefined) {
+        throw new RequestFailure(
+          `${this.primaryDescription()} cannot match a retry of operation ${requestId} to its first attempt; call without operation_id, or restart that server on this version; queued; not_executed`,
+          'primary_unsupported', details,
+        );
+      }
+      identity = undefined;
+    }
+    if (requiresScriptPreconditions(endpoint, data) && !this.primaryFeatures.has('script_preconditions')) {
+      const argument = endpoint === '/api/find-and-replace-in-scripts' ? 'expected_revisions' : 'expected_revision';
+      throw new RequestFailure(
+        `${this.primaryDescription()} serves a Studio plugin that ignores ${argument} and would write unchecked; restart that server on this version, or call without ${argument}; queued; not_executed`,
+        'primary_unsupported', details,
+      );
+    }
+    if (requiresAtomicProperties(endpoint, data) && !this.primaryFeatures.has('atomic_properties')) {
+      throw new RequestFailure(
+        `${this.primaryDescription()} serves a Studio plugin that ignores atomic and dryRun and would write each property separately; restart that server on this version, or call without atomic; queued; not_executed`,
+        'primary_unsupported', details,
+      );
+    }
+    if (endpoint === '/api/capture-micro-profiler' && !this.primaryFeatures.has('micro_profiler_transfer')) {
+      throw new RequestFailure(
+        `${this.primaryDescription()} serves a Studio plugin that analyzes MicroProfiler captures in Studio and stages none for this server to read; restart that server on this version; queued; not_executed`,
+        'primary_unsupported', details,
+      );
+    }
     const controller = new AbortController();
     const effectiveTimeoutMs = Math.max(1, request.timeoutMs);
     let requestBody: string;
@@ -424,6 +524,12 @@ export class ProxyBridgeService extends BridgeService {
       if ('error' in result && result.error !== undefined && typeof result.error !== 'string') {
         primaryError = true;
         throw result.error;
+      }
+      if (response.status === 403 && 'error' in result && result.error === 'forbidden_endpoint') {
+        throw new RequestFailure(
+          `${this.primaryDescription()} refused ${endpoint} through /proxy: that server's edition does not permit this Studio endpoint, so nothing reached Studio; queued; not_executed`,
+          'forbidden_endpoint', details,
+        );
       }
       if ('error' in result && typeof result.error === 'string') {
         const details = 'details' in result ? parseFailureDetails(result.details, { requestId, targetPeerId }) : undefined;

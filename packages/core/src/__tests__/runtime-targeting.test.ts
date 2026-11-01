@@ -149,9 +149,11 @@ describe('explicit runtime viewport targeting', () => {
     function setupSolo(roles: string[]) {
       const bridge = new BridgeService();
       for (const role of roles) register(bridge, 'instance:solo', role);
+      // Two distinct pixels: a single-colour frame would send the capture to
+      // the real host-window fallback, which this routing test must not reach.
       const request = jest.spyOn(StudioHttpClient.prototype, 'request').mockImplementation(async () => ({
-        success: true, source: 'StudioCaptureService', encoding: 'rgba8', width: 1, height: 1,
-        data: Buffer.from([10, 20, 30, 255]).toString('base64'),
+        success: true, source: 'StudioCaptureService', encoding: 'rgba8', width: 2, height: 1,
+        data: Buffer.from([10, 20, 30, 255, 40, 50, 60, 255]).toString('base64'),
       }));
       lastTools = new RobloxStudioTools(bridge);
       return { request, tools: lastTools };
@@ -172,6 +174,17 @@ describe('explicit runtime viewport targeting', () => {
         'peer:instance:solo:client-1',
         'peer:instance:solo:client-1',
       ]);
+    });
+
+    test('a client that left the solo playtest is reported missing, not ambiguous', async () => {
+      const { tools, request } = setupSolo(['edit', 'server']);
+      await expect(tools.captureMicroProfiler('client-1', { duration_ms: 1000 }, 'instance:solo')).rejects.toMatchObject({
+        routingError: {
+          code: 'target_role_not_present_on_instance',
+          message: expect.stringContaining('has no client-1 Peer; connected roles: edit, server'),
+        },
+      });
+      expect(request).not.toHaveBeenCalled();
     });
   });
 

@@ -1,9 +1,11 @@
 import { readRbxmInput } from '../rbxm-input.js';
 import { StudioHttpClient } from './studio-client.js';
-import { BridgeService, isValidOperationId, MAX_OPERATION_ID_LENGTH, MAX_OPERATION_WAIT_MS, RoutingFailure } from '../bridge-service.js';
+import { BridgeService, isValidOperationId, MAX_OPERATION_ID_LENGTH, MAX_OPERATION_WAIT_MS, RequestFailure, RoutingFailure, StudioOperationError } from '../bridge-service.js';
 import type { PublicStudioPeer, RequestStatus, StudioPeer } from '../bridge-service.js';
 import {
+  openCloudAssetUploadLimitBytes,
   OpenCloudClient,
+  type AssetOperationResponse,
   type AssetSearchParams,
   type CreatorStoreSearchCategory,
 } from '../opencloud-client.js';
@@ -23,10 +25,13 @@ import {
 } from '../image-decode.js';
 import { DOC_CATEGORIES, getRobloxDoc, isDocCategory } from '../roblox-docs.js';
 import { findBuiltInStudioSkill, loadBuiltInStudioSkills } from '../studio-skills.js';
+import { runManageExperience } from './experience.js';
 import { runManageMonetization } from './monetization.js';
+import { SCRIPT_CLASS_FILTERS } from './definitions.js';
 import { rgbaToJpeg } from '../jpeg-encoder.js';
 import { rgbaToPng } from '../png-encoder.js';
 import { pathNotice } from '../path-notice.js';
+import { readRegularFileWithinLimitAsync } from '../local-file.js';
 import {
   captureStudioWindow,
   cropToViewport,
@@ -38,7 +43,30 @@ import {
   prepareHostWindowCapture,
 } from '../host-capture.js';
 import type { HostCaptureResult, HostWindowIdentity, ViewportRect } from '../host-capture.js';
-import { createHash } from 'crypto';
+import { analyzeMicroProfilerCapture } from '../micro-profiler/analysis.js';
+import {
+  CaptureTransferError,
+  CLIENT_CHUNK_BYTES,
+  idleAsLongAsRead,
+  isMicroProfilerAction,
+  MICRO_PROFILER_ACTIONS,
+  MICRO_PROFILER_DEFAULT_DURATION_MS,
+  MICRO_PROFILER_MAX_DURATION_MS,
+  MICRO_PROFILER_MIN_DURATION_MS,
+  MICRO_PROFILER_REQUEST_MARGIN_MS,
+  microProfilerAnalysisOptions,
+  parseCaptureTransfer,
+  pullCapture,
+  readWindowSidecar,
+  resolveCapturePath,
+  SERVER_CHUNK_BYTES,
+  windowFromRecording,
+  writeWindowSidecar,
+} from '../micro-profiler/capture.js';
+import type { PaceCaptureChunk } from '../micro-profiler/capture.js';
+import { createHash, randomUUID } from 'crypto';
+import { ReferenceUploads } from './reference-uploads.js';
+import type { ReferenceUploadAttempt, ReferenceUploadCheckpoint, ReferenceUploadProgress, ReferenceUploadView } from './reference-uploads.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -179,6 +207,35 @@ const GREP_SCRIPTS_TIMEOUT_MS = 120_000;
 const MAX_GREP_PATTERN_UTF8_BYTES = 4096;
 const RUNTIME_LOG_PEER_TIMEOUT_MS = 5_000;
 const STUDIO_ASSISTANT_SOURCE_IMAGE_LABEL = 'Studio Assistant Source Image';
+
+/** Rejects a classFilter that is not one exact script class name. */
+function assertScriptClassFilter(tool: string, classFilter: unknown): void {
+  if (classFilter === undefined) return;
+  if (typeof classFilter !== 'string' || !SCRIPT_CLASS_FILTERS.some((className) => className === classFilter)) {
+    throw new Error(`${tool} classFilter must be one of ${SCRIPT_CLASS_FILTERS.join(', ')}`);
+  }
+}
+
+function optionalRevision(tool: string, value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`${tool} expected_revision must be a nonempty string`);
+  }
+  return value;
+}
+
+function optionalRevisionMap(tool: string, value: unknown): Record<string, string> | undefined {
+  if (value === undefined) return undefined;
+  const invalid = new Error(`${tool} expected_revisions must map script paths to nonempty revision strings`);
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw invalid;
+  const revisions: Record<string, string> = {};
+  for (const [scriptPath, revision] of Object.entries(value)) {
+    if (scriptPath.length === 0 || typeof revision !== 'string' || revision.length === 0) throw invalid;
+    revisions[scriptPath] = revision;
+  }
+  return revisions;
+}
+
 const CREATOR_STORE_SEARCH_TYPES = new Set<string>([
   'Audio',
   'Model',
@@ -277,6 +334,75 @@ function sleep(ms: number): Promise<void> {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+const MAX_FAILURE_MESSAGE_LENGTH = 500;
+
+function boundedMessage(message: string): string {
+  return message.slice(0, MAX_FAILURE_MESSAGE_LENGTH);
+}
+
+// A failure's code, so callers can tell permission (forbidden_endpoint),
+// version (primary_unsupported), service (service_unavailable), routing, and
+// transport (request_timeout, peer_unregistered, ...) failures apart.
+function failureCode(error: unknown, fallback: string): string {
+  if (error instanceof RequestFailure || error instanceof StudioOperationError) return error.code;
+  if (error instanceof RoutingFailure) return error.routingError.code;
+  return fallback;
+}
+
+function codedError(error: unknown): { code: string; message: string } {
+  return { code: failureCode(error, 'studio_error'), message: boundedMessage(errorMessage(error)) };
+}
+
+// A fanned-out Peer request that rejected, shaped like a Studio handler failure.
+function peerRequestFailure(reason: unknown): { error: string; message: string } {
+  return { error: failureCode(reason, 'request_failed'), message: boundedMessage(errorMessage(reason)) };
+}
+
+function unretainedStatus(requestId: string): Record<string, unknown> {
+  return {
+    requestId,
+    state: 'unknown',
+    outcome: 'unknown',
+    message: 'No retained operation record. It may have expired, been evicted, or belonged to an earlier server session. Do not infer that the mutation was not executed.',
+  };
+}
+
+// For an upload no retry can join, its progress has no one to inform.
+const UNTRACKED_UPLOAD: ReferenceUploadProgress = {
+  sending: () => undefined,
+  accepted: () => undefined,
+  created: () => undefined,
+};
+
+// Bridge refusals at admission: no operation record was created, so nothing
+// under that ID can run. Any other failure may follow an admitted operation.
+const NOT_ADMITTED_FAILURE_CODES = new Set([
+  'invalid_operation_id', 'request_serialization_failed', 'request_too_large',
+  'request_capacity_exceeded', 'primary_unsupported', 'forbidden_endpoint',
+]);
+
+function generationNotAdmitted(error: unknown): boolean {
+  if (error instanceof RoutingFailure) return true;
+  return error instanceof RequestFailure && NOT_ADMITTED_FAILURE_CODES.has(error.code)
+    && error.details.stage === 'queued' && error.details.outcome === 'not_executed';
+}
+
+// pending: Studio may still be generating. A wait that ended without a result
+// is failed when nothing ran, otherwise unknown: a late result can still settle it.
+function generationPhase(status: RequestStatus): 'generating' | 'completed' | 'failed' | 'unknown' {
+  if (status.state === 'pending') return 'generating';
+  if (status.state === 'settled') return status.outcome === 'success' ? 'completed' : 'failed';
+  return status.outcome === 'not_executed' || status.executionOutcome === 'not_executed' ? 'failed' : 'unknown';
+}
+
+// edit, server, then clients in numeric order.
+function roleOrder(role: string): number {
+  if (role === 'edit') return 0;
+  if (role === 'server') return 1;
+  const client = /^client-(\d+)$/.exec(role);
+  return client ? 2 + Number(client[1]) : Number.MAX_SAFE_INTEGER;
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -463,6 +589,18 @@ function loadMicroProfilerBaseline(source: unknown, sourcePath: unknown): Record
   return undefined;
 }
 
+// Schema 2 summaries convert MicroProfiler ticks with the snapshot's clock.
+// Schema 1 assumed nanosecond ticks, inflating CPU absolute times (and deflating
+// count_per_s) by the CPU timer's GHz rate. CPU per-second rates are ratios of
+// two equally scaled values, so they stay comparable across versions. GPU ticks
+// were already nanoseconds, so schema-1 GPU rates were divided by an inflated
+// duration and are not comparable.
+function microProfilerSchema(body: Record<string, unknown>): 'snapshot_clock' | 'legacy' | undefined {
+  // A failed capture (error body) is not a summary of either kind.
+  if (typeof body.error === 'string') return undefined;
+  return numberField(body, 'schema_version') >= 2 ? 'snapshot_clock' : 'legacy';
+}
+
 function compareMicroProfilerRows(
   currentRows: Record<string, unknown>[],
   baselineRows: Record<string, unknown>[],
@@ -471,6 +609,7 @@ function compareMicroProfilerRows(
   keyForRow: (row: Record<string, unknown>) => string,
   labelForRow: (row: Record<string, unknown>, fallbackKey: string) => Record<string, unknown>,
   maxRows: number,
+  legacySide?: 'current' | 'baseline',
 ): Record<string, unknown>[] {
   const currentByKey = new Map<string, Record<string, unknown>>();
   const baselineByKey = new Map<string, Record<string, unknown>>();
@@ -525,6 +664,14 @@ function compareMicroProfilerRows(
       delta_count_per_s: roundNumber(currentCountPerS - baselineCountPerS),
     };
     if (!usesFullIndex) row.match_scope = 'returned_rows';
+    if (legacySide !== undefined) {
+      for (const field of [
+        `${legacySide}_inclusive_us`, `${legacySide}_exclusive_us`, `${legacySide}_count_per_s`,
+        'delta_inclusive_us', 'delta_exclusive_us', 'delta_count_per_s',
+      ]) {
+        delete row[field];
+      }
+    }
     const pct = percentDelta(currentUsPerS, baselineUsPerS);
     if (pct !== undefined) row.delta_pct = pct;
     deltas.push(row);
@@ -542,6 +689,11 @@ function compareMicroProfilerCaptures(
   const currentDurationMs = microProfilerDurationMs(current);
   const baselineDurationMs = microProfilerDurationMs(baseline);
   const maxRows = Math.max(1, Math.min(100, Math.trunc(options.maxRows ?? 20)));
+  const currentSchema = microProfilerSchema(current);
+  const baselineSchema = microProfilerSchema(baseline);
+  const legacySide = currentSchema === 'snapshot_clock' && baselineSchema === 'legacy'
+    ? 'baseline'
+    : baselineSchema === 'snapshot_clock' && currentSchema === 'legacy' ? 'current' : undefined;
 
   const groupDeltas = compareMicroProfilerRows(
     rowSet(current, 'groups', 'top_groups'),
@@ -551,6 +703,7 @@ function compareMicroProfilerCaptures(
     (row) => stringField(row, 'group'),
     (row, key) => ({ group: stringField(row, 'group') || key }),
     maxRows,
+    legacySide,
   );
 
   const timerDeltas = compareMicroProfilerRows(
@@ -565,6 +718,7 @@ function compareMicroProfilerCaptures(
       timer_id: row.timer_id,
     }),
     maxRows,
+    legacySide,
   );
 
   const threadDeltas = compareMicroProfilerRows(
@@ -579,6 +733,7 @@ function compareMicroProfilerCaptures(
       is_gpu: row.is_gpu,
     }),
     maxRows,
+    legacySide,
   );
 
   const edgeDeltas = compareMicroProfilerRows(
@@ -602,11 +757,12 @@ function compareMicroProfilerCaptures(
       child: nestedRecord(row, 'child') ?? { label: key },
     }),
     maxRows,
+    legacySide,
   );
 
   const currentHasIndex = asRecord(current.comparison_index) !== undefined;
   const baselineHasIndex = asRecord(baseline.comparison_index) !== undefined;
-  return {
+  const comparison: Record<string, unknown> = {
     baseline_label: options.baselineLabel ?? 'baseline',
     current_label: options.currentLabel ?? 'current',
     basis: 'inclusive_us_per_second normalized by each capture analysis duration; deltas use current minus baseline.',
@@ -623,6 +779,12 @@ function compareMicroProfilerCaptures(
     threads: threadDeltas,
     call_edges: edgeDeltas,
   };
+  if (legacySide !== undefined) {
+    comparison.warnings = [
+      `The ${legacySide} summary predates schema_version 2 and assumed nanosecond MicroProfiler ticks, so its CPU absolute times and count_per_s are scaled by the CPU timer rate. Absolute and count-rate deltas are omitted; *_us_per_s deltas and delta_pct remain comparable for CPU work, but not for GPU-thread rows (include_gpu). Recapture it for full comparisons.`,
+    ];
+  }
+  return comparison;
 }
 
 const NETWORK_PROFILE_KEYS = [
@@ -1058,6 +1220,10 @@ export class RobloxStudioTools {
   private hostWindowCapture: HostWindowCaptureFn = captureStudioWindow;
   private hostViewportRects = new Map<string, HostViewportRectCacheEntry>();
   private viewportCaptureQueues = new Map<string, Promise<void>>();
+  // generate_model reference images, shared by retries under one operation ID.
+  private readonly referenceUploads = new ReferenceUploads();
+  // Paces chunks of a client capture copied through the client broker.
+  private captureChunkPace: PaceCaptureChunk = idleAsLongAsRead;
 
   constructor(bridge: BridgeService) {
     this.client = new StudioHttpClient(bridge);
@@ -1272,9 +1438,20 @@ export class RobloxStudioTools {
   private _targetForInstanceId(instance_id: string | undefined, choice: TargetChoice): string {
     const requested = choice.requested || undefined;
     const selected = this._peerSelectedByInstanceId(instance_id);
-    if (!selected || !choice.accepts(selected.role)) return requested ?? choice.fallback;
+    if (!selected || instance_id === undefined || !choice.accepts(selected.role)) return requested ?? choice.fallback;
     if (requested === undefined) return selected.role;
     if (requested !== selected.role && !SCOPE_WIDE_TARGETS.has(requested)) {
+      // A playtest Peer that left (a client whose connection dropped) can leave
+      // one runtime Peer that the Instance ID then appears to select. The real
+      // problem is the missing role, not an ambiguous target.
+      const roles = this.bridge.getPeersInScope(instance_id).map((peer) => peer.role);
+      if (!roles.includes(requested)) {
+        throw new RoutingFailure({
+          code: 'target_role_not_present_on_instance',
+          message: `instance_id "${instance_id}" has no ${requested} Peer; connected roles: ${roles.join(', ') || 'none'}. A playtest client that disconnected does not return; restart the playtest to get it back.`,
+          data: this._routingErrorData(),
+        });
+      }
       throw new RoutingFailure({
         code: 'ambiguous_target',
         message: `instance_id "${instance_id}" selects ${selected.role}, but target=${requested}. Omit target, pass target=${selected.role}, or pass the controller Instance ID with target=${requested}.`,
@@ -1519,11 +1696,33 @@ export class RobloxStudioTools {
     }
   }
 
+  // A primary of this version serves simulation reads natively; an older one
+  // only through generated Luau, which a restricted /proxy refuses.
+  private _supportsSimulationReads(): boolean {
+    return this.bridge.supportsPrimaryFeature('simulation_reads');
+  }
+
+  private _parseSimulationReadResponse(response: unknown, label: string): unknown {
+    const record = asRecord(response);
+    if (!record) throw new StudioOperationError(`${label} returned an invalid response`, 'invalid_response');
+    const { success, error, message, ...details } = record;
+    if (success === false) {
+      const code = typeof error === 'string' && error !== '' ? error : 'read_failed';
+      throw new StudioOperationError(typeof message === 'string' && message !== '' ? message : `${label} failed: ${code}`, code, details);
+    }
+    if (typeof error === 'string') throw new StudioOperationError(error, 'studio_error');
+    return response;
+  }
+
   private async _executeNetworkStateOperation(
     instanceId: string,
     role: string,
     operation: 'get' | 'reset',
   ): Promise<unknown> {
+    if (operation === 'get' && this._supportsSimulationReads()) {
+      const response = await this._request('/api/get-network-simulation-state', {}, instanceId, role);
+      return this._parseSimulationReadResponse(response, 'network simulation get');
+    }
     const code = buildNetworkStateLuau(operation);
     const response = await this._request('/api/execute-luau', { code }, instanceId, role);
     return this._parseExecuteLuauJsonResponse(response, `network simulation ${operation}`);
@@ -1535,6 +1734,12 @@ export class RobloxStudioTools {
     operation: 'get' | 'set',
     options: Record<string, unknown>,
   ): Promise<unknown> {
+    if (operation === 'get' && this._supportsSimulationReads()) {
+      const data: Record<string, unknown> = { includeDeviceList: options.includeDeviceList !== false };
+      if (options.deviceId !== undefined) data.deviceId = options.deviceId;
+      const response = await this._request('/api/get-device-simulator-state', data, instanceId, role);
+      return this._parseSimulationReadResponse(response, 'device simulator get');
+    }
     const code = buildDeviceSimulatorLuau(operation, options);
     const response = await this._request('/api/execute-luau', { code }, instanceId, role);
     return this._parseExecuteLuauJsonResponse(response, `device simulator ${operation}`);
@@ -1728,7 +1933,14 @@ export class RobloxStudioTools {
     }));
   }
 
-  // Monetization APIs address a universe, which Studio reports as game.GameId.
+  async manageExperience(request: Record<string, unknown>, instance_id?: string) {
+    return this._textResult(await runManageExperience(request, {
+      client: this.openCloudClient,
+      connectedUniverseId: () => this._connectedUniverseId(instance_id),
+    }));
+  }
+
+  // Open Cloud universe APIs address a universe, which Studio reports as game.GameId.
   private async _connectedUniverseId(instance_id?: string): Promise<number> {
     let info: StudioToolResponse;
     try {
@@ -1836,11 +2048,31 @@ export class RobloxStudioTools {
     };
   }
 
-  async setProperties(instancePath: string, properties: Record<string, unknown>, instance_id?: string, operation_id?: string) {
+  async setProperties(
+    instancePath: string,
+    properties: Record<string, unknown>,
+    instance_id?: string,
+    operation_id?: string,
+    options: { atomic?: unknown; dryRun?: unknown } = {},
+  ) {
     if (!instancePath || !properties) {
       throw new Error('instancePath and properties are required for set_properties');
     }
-    const response = await this._callSingle('/api/set-properties', { instancePath, properties }, undefined, instance_id, undefined, undefined, operation_id);
+    const { atomic, dryRun } = options;
+    if (atomic !== undefined && typeof atomic !== 'boolean') {
+      throw new Error('set_properties atomic must be a boolean');
+    }
+    if (dryRun !== undefined && typeof dryRun !== 'boolean') {
+      throw new Error('set_properties dryRun must be a boolean');
+    }
+    if (dryRun === true && atomic !== true) {
+      throw new Error('set_properties dryRun requires atomic: true');
+    }
+    // Omitted options keep the original payload, and with it the operation fingerprint.
+    const payload: Record<string, unknown> = { instancePath, properties };
+    if (atomic !== undefined) payload.atomic = atomic;
+    if (dryRun !== undefined) payload.dryRun = dryRun;
+    const response = await this._callSingle('/api/set-properties', payload, undefined, instance_id, undefined, undefined, operation_id);
     return { content: [{ type: 'text', text: JSON.stringify(response) }] };
   }
 
@@ -1872,19 +2104,17 @@ export class RobloxStudioTools {
     });
   }
 
-  async setScriptSource(instancePath: string, source: string, instance_id?: string) {
+  async setScriptSource(instancePath: string, source: string, instance_id?: string, operation_id?: string, expected_revision?: string) {
     if (!instancePath || typeof source !== 'string') {
       throw new Error('Instance path and source code string are required for set_script_source');
     }
-    const response = await this._callSingle('/api/set-script-source', { instancePath, source }, undefined, instance_id);
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(response)
-        }
-      ]
-    };
+    const expectedRevision = optionalRevision('set_script_source', expected_revision);
+    const response = await this._callSingle('/api/set-script-source', {
+      instancePath,
+      source,
+      ...(expectedRevision === undefined ? {} : { expectedRevision }),
+    }, undefined, instance_id, undefined, undefined, operation_id);
+    return this._textResult(response);
   }
 
 
@@ -1938,34 +2168,46 @@ export class RobloxStudioTools {
     return this._textResult(response);
   }
 
-  async insertScriptLines(instancePath: string, afterLine: number, newContent: string, instance_id?: string) {
+  async insertScriptLines(
+    instancePath: string,
+    afterLine: number,
+    newContent: string,
+    instance_id?: string,
+    operation_id?: string,
+    expected_revision?: string,
+  ) {
     if (!instancePath || typeof newContent !== 'string') {
       throw new Error('Instance path and newContent are required for insert_script_lines');
     }
-    const response = await this._callSingle('/api/insert-script-lines', { instancePath, afterLine: afterLine || 0, newContent }, undefined, instance_id);
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(response)
-        }
-      ]
-    };
+    const expectedRevision = optionalRevision('insert_script_lines', expected_revision);
+    const response = await this._callSingle('/api/insert-script-lines', {
+      instancePath,
+      afterLine: afterLine || 0,
+      newContent,
+      ...(expectedRevision === undefined ? {} : { expectedRevision }),
+    }, undefined, instance_id, undefined, undefined, operation_id);
+    return this._textResult(response);
   }
 
-  async deleteScriptLines(instancePath: string, startLine: number, endLine: number, instance_id?: string) {
+  async deleteScriptLines(
+    instancePath: string,
+    startLine: number,
+    endLine: number,
+    instance_id?: string,
+    operation_id?: string,
+    expected_revision?: string,
+  ) {
     if (!instancePath || !startLine || !endLine) {
       throw new Error('Instance path, startLine, and endLine are required for delete_script_lines');
     }
-    const response = await this._callSingle('/api/delete-script-lines', { instancePath, startLine, endLine }, undefined, instance_id);
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(response)
-        }
-      ]
-    };
+    const expectedRevision = optionalRevision('delete_script_lines', expected_revision);
+    const response = await this._callSingle('/api/delete-script-lines', {
+      instancePath,
+      startLine,
+      endLine,
+      ...(expectedRevision === undefined ? {} : { expectedRevision }),
+    }, undefined, instance_id, undefined, undefined, operation_id);
+    return this._textResult(response);
   }
 
 
@@ -1990,6 +2232,7 @@ export class RobloxStudioTools {
     if (Buffer.byteLength(pattern, 'utf8') > MAX_GREP_PATTERN_UTF8_BYTES) {
       throw new Error(`Pattern must not exceed ${MAX_GREP_PATTERN_UTF8_BYTES} UTF-8 bytes`);
     }
+    assertScriptClassFilter('grep_scripts', options?.classFilter);
     const response = await this._callSingle('/api/grep-scripts', {
       pattern,
       ...(options ?? {}),
@@ -2136,11 +2379,11 @@ export class RobloxStudioTools {
     };
   }
 
-  async evalServerRuntime(code: string, instance_id?: string) {
+  async evalServerRuntime(code: string, instance_id?: string, operation_id?: string) {
     if (!code) {
       throw new Error('Code is required for eval_server_runtime');
     }
-    const response = await this._callSingle('/api/eval-runtime', { code }, 'server', instance_id);
+    const response = await this._callSingle('/api/eval-runtime', { code }, 'server', instance_id, undefined, undefined, operation_id);
     return {
       content: [
         {
@@ -2151,14 +2394,17 @@ export class RobloxStudioTools {
     };
   }
 
-  async evalClientRuntime(code: string, target?: string, instance_id?: string) {
+  async evalClientRuntime(code: string, target?: string, instance_id?: string, operation_id?: string) {
     if (!code) {
       throw new Error('Code is required for eval_client_runtime');
     }
     if (target && !target.startsWith('client-')) {
       throw new Error(`eval_client_runtime requires target=client-N (got: ${target})`);
     }
-    const response = await this._callSingle('/api/eval-runtime', { code }, { requested: target, fallback: 'client-1', accepts: isClientRole }, instance_id);
+    const response = await this._callSingle(
+      '/api/eval-runtime', { code }, { requested: target, fallback: 'client-1', accepts: isClientRole },
+      instance_id, undefined, undefined, operation_id,
+    );
     return {
       content: [
         {
@@ -2254,13 +2500,13 @@ export class RobloxStudioTools {
 
     const roleEntries = await Promise.all(resolved.roles.map(async (role) => {
       const state: Record<string, unknown> = {};
-      const errors: Record<string, string> = {};
+      const errors: Record<string, { code: string; message: string }> = {};
 
       if (includeNetwork) {
         try {
           state.network = await this._executeNetworkStateOperation(resolved.instanceId, role, 'get');
         } catch (error) {
-          errors.network = errorMessage(error);
+          errors.network = codedError(error);
         }
       }
 
@@ -2273,7 +2519,7 @@ export class RobloxStudioTools {
             { includeDeviceList: false },
           );
         } catch (error) {
-          errors.deviceSimulator = errorMessage(error);
+          errors.deviceSimulator = codedError(error);
         }
       }
 
@@ -2862,7 +3108,10 @@ export class RobloxStudioTools {
           }
           const response = responseValue as Record<string, unknown>;
           if (typeof response.error === 'string') {
-            return { peerId: peer.peerId, role: peer.role, error: response.error };
+            // Broker failures carry a code in `error` and the diagnosis in `message`.
+            const error = typeof response.message === 'string' && response.message !== ''
+              ? `${response.error}: ${response.message}` : response.error;
+            return { peerId: peer.peerId, role: peer.role, error };
           }
           if (
             !Array.isArray(response.entries) ||
@@ -3010,35 +3259,50 @@ export class RobloxStudioTools {
   }
 
   async captureMicroProfiler(target?: string, request: Record<string, unknown> = {}, instance_id?: string) {
-    const data: Record<string, unknown> = { ...request };
-    const outputPath = data.output_path;
-    const summaryOutputPath = data.summary_output_path;
-    const baselinePath = data.baseline_path;
-    const baseline = data.baseline;
-    const baselineLabel = typeof data.baseline_label === 'string' ? data.baseline_label : undefined;
-    const currentLabel = typeof data.current_label === 'string' ? data.current_label : undefined;
-    const maxComparisonRows = typeof data.max_comparison_rows === 'number' ? data.max_comparison_rows : undefined;
-    const includeComparisonIndex = data.include_comparison_index === true;
-    delete data.output_path;
-    delete data.summary_output_path;
-    delete data.baseline_path;
-    delete data.baseline;
-    delete data.baseline_label;
-    delete data.current_label;
-    delete data.max_comparison_rows;
-    delete data.include_comparison_index;
-
+    const action = request.action ?? 'capture';
+    if (!isMicroProfilerAction(action)) {
+      throw new Error(`action must be one of ${MICRO_PROFILER_ACTIONS.join(', ')}`);
+    }
+    const outputPath = request.output_path;
+    const summaryOutputPath = request.summary_output_path;
+    const inputPath = request.input_path;
+    const baselinePath = request.baseline_path;
+    const baseline = request.baseline;
     if (outputPath !== undefined && typeof outputPath !== 'string') {
       throw new Error('output_path must be a string when provided');
     }
     if (summaryOutputPath !== undefined && typeof summaryOutputPath !== 'string') {
       throw new Error('summary_output_path must be a string when provided');
     }
-    if (outputPath) {
-      data.__mcp_include_raw_buffer = true;
+    const finish = {
+      summaryOutputPath,
+      baselinePath,
+      baseline,
+      baselineLabel: typeof request.baseline_label === 'string' ? request.baseline_label : undefined,
+      currentLabel: typeof request.current_label === 'string' ? request.current_label : undefined,
+      maxComparisonRows: typeof request.max_comparison_rows === 'number' ? request.max_comparison_rows : undefined,
+      includeComparisonIndex: request.include_comparison_index === true,
+    };
+    const analysisOptions = microProfilerAnalysisOptions(request);
+    analysisOptions.includeComparisonIndex = Boolean(summaryOutputPath || baselinePath || baseline || finish.includeComparisonIndex);
+
+    // A saved capture (an earlier capture_path, or a Studio "Dump in binary
+    // format" .gprx file) is analyzed without Studio.
+    if (action === 'analyze') {
+      if (typeof inputPath !== 'string' || inputPath === '') {
+        throw new Error('input_path is required for action="analyze": a capture_path from an earlier capture, or a MicroProfiler .gprx dump');
+      }
+      const resolvedInput = path.resolve(inputPath);
+      const bytes = await fs.promises.readFile(resolvedInput);
+      // A capture this tool saved re-analyzes over the frames it was recorded for.
+      const window = await readWindowSidecar(resolvedInput);
+      const summary = await analyzeMicroProfilerCapture(bytes, { ...analysisOptions, window });
+      summary.action = action;
+      summary.capture = { path: resolvedInput, bytes: bytes.length, source: 'file', recorded_window: window !== undefined };
+      return this._finishMicroProfilerResult(summary, finish);
     }
-    if (summaryOutputPath || baselinePath || baseline || includeComparisonIndex) {
-      data.__mcp_include_comparison_index = true;
+    if (inputPath !== undefined) {
+      throw new Error('input_path is only used with action="analyze"');
     }
 
     const refresh = this.bridge.refreshTopologyForRouting();
@@ -3054,53 +3318,181 @@ export class RobloxStudioTools {
       });
     }
 
-    data.__mcp_instance_id = resolved.targetInstanceId;
-    data.__mcp_target_role = resolved.targetRole;
-    const response = await this._requestPeer(
-      '/api/capture-micro-profiler',
-      data,
-      resolved.targetPeerId,
-    );
-
-    const body: unknown = response !== null && typeof response === 'object' && !Array.isArray(response)
-      ? { ...response, target: resolved.targetRole }
-      : response;
-
-    if (body !== null && typeof body === 'object' && !Array.isArray(body)) {
-      const mutable = body as Record<string, unknown>;
-      const rawSnapshotBase64 = mutable.raw_snapshot_base64;
-      if (typeof rawSnapshotBase64 === 'string') {
-        if (typeof outputPath === 'string' && outputPath !== '') {
-          const resolvedOutputPath = path.resolve(outputPath);
-          fs.mkdirSync(path.dirname(resolvedOutputPath), { recursive: true });
-          fs.writeFileSync(resolvedOutputPath, Buffer.from(rawSnapshotBase64, 'base64'));
-          mutable.output_path = resolvedOutputPath;
-        }
-        delete mutable.raw_snapshot_base64;
+    const role = resolved.targetRole;
+    // Every Peer of a solo playtest runs in one Studio process, and MicroProfiler
+    // records the whole process. A client there is recorded through the server
+    // Peer: the same capture, copied back directly instead of through the
+    // client broker, which a large capture can overwhelm.
+    const processPeers = this.bridge.getPeers().filter((peer) => peer.instanceId === resolved.targetInstanceId);
+    const recorder = isClientRole(role) ? processPeers.find((peer) => peer.role === 'server') : undefined;
+    const peerId = recorder?.peerId ?? resolved.targetPeerId;
+    const recordedBy = recorder?.role ?? role;
+    const processRoles = processPeers.map((peer) => peer.role).sort((a, b) => roleOrder(a) - roleOrder(b));
+    const placement: Record<string, unknown> = {
+      target: role,
+      ...(recordedBy !== role ? { recorded_by: recordedBy } : {}),
+      ...(processRoles.length > 1 ? { process_roles: processRoles } : {}),
+    };
+    const durationMs = typeof request.duration_ms === 'number' && Number.isFinite(request.duration_ms)
+      ? Math.min(MICRO_PROFILER_MAX_DURATION_MS, Math.max(MICRO_PROFILER_MIN_DURATION_MS, Math.floor(request.duration_ms)))
+      : MICRO_PROFILER_DEFAULT_DURATION_MS;
+    const pluginRequest: Record<string, unknown> = {
+      action,
+      __mcp_instance_id: resolved.targetInstanceId,
+      __mcp_target_role: role,
+    };
+    if (action === 'capture') pluginRequest.duration_ms = durationMs;
+    // Recording waits in Studio; finalizing a stream and staging it takes a few seconds more.
+    const timeoutMs = action === 'capture' ? durationMs + MICRO_PROFILER_REQUEST_MARGIN_MS : MICRO_PROFILER_REQUEST_MARGIN_MS;
+    const response = await this._requestPeer('/api/capture-micro-profiler', pluginRequest, peerId, timeoutMs);
+    if (response === null || typeof response !== 'object' || Array.isArray(response)) {
+      return { content: [{ type: 'text', text: JSON.stringify(response) }] };
+    }
+    const reply: Record<string, unknown> = { ...(response as Record<string, unknown>), ...placement };
+    if (action === 'start' || typeof reply.error === 'string') {
+      delete reply.transfer;
+      return typeof reply.error === 'string'
+        ? this._microProfilerFailure(reply, summaryOutputPath)
+        : { content: [{ type: 'text', text: JSON.stringify(reply) }] };
+    }
+    const transfer = parseCaptureTransfer(reply.transfer);
+    if (transfer === undefined) {
+      const staged = asRecord(reply.transfer)?.transfer_id;
+      if (typeof staged === 'string') {
+        await this._requestPeer('/api/micro-profiler-release', { transfer_id: staged }, peerId).catch(() => undefined);
       }
-
-      const baselineCapture = loadMicroProfilerBaseline(baseline, baselinePath);
-      if (baselineCapture) {
-        mutable.baseline_comparison = compareMicroProfilerCaptures(mutable, baselineCapture, {
-          baselineLabel,
-          currentLabel,
-          maxRows: maxComparisonRows,
-        });
-      }
-
-      if (typeof summaryOutputPath === 'string' && summaryOutputPath !== '') {
-        const resolvedSummaryPath = path.resolve(summaryOutputPath);
-        fs.mkdirSync(path.dirname(resolvedSummaryPath), { recursive: true });
-        fs.writeFileSync(resolvedSummaryPath, JSON.stringify(mutable, null, 2), 'utf8');
-        mutable.summary_output_path = resolvedSummaryPath;
-      }
-
-      if (!includeComparisonIndex) {
-        delete mutable.comparison_index;
-      }
+      return this._microProfilerFailure({
+        error: 'micro_profiler_transfer_invalid',
+        message: 'Studio finished the capture but did not stage readable capture data.',
+        ...placement,
+        recording: reply.recording,
+        transfer: reply.transfer,
+      }, summaryOutputPath);
     }
 
+    const recording = asRecord(reply.recording) ?? {};
+    let bytes: Buffer;
+    try {
+      const throughBroker = isClientRole(recordedBy);
+      bytes = await pullCapture(
+        transfer,
+        throughBroker ? CLIENT_CHUNK_BYTES : SERVER_CHUNK_BYTES,
+        (chunk) => this._requestPeer('/api/micro-profiler-read', chunk, peerId, MICRO_PROFILER_REQUEST_MARGIN_MS),
+        throughBroker ? this.captureChunkPace : undefined,
+      );
+    } catch (error) {
+      await this._requestPeer('/api/micro-profiler-release', { transfer_id: transfer.transferId }, peerId).catch(() => undefined);
+      const detail = error instanceof CaptureTransferError ? error.detail : undefined;
+      return this._microProfilerFailure({
+        error: 'micro_profiler_transfer_failed',
+        message: `The capture was recorded but could not be copied from Studio: ${error instanceof Error ? error.message : String(error)}`,
+        ...placement,
+        recording,
+        detail,
+      }, summaryOutputPath);
+    }
+
+    // A capture that cannot be saved is still analyzed; the result says why.
+    let capturePath: string | undefined;
+    let saveError: string | undefined;
+    try {
+      capturePath = await resolveCapturePath(typeof outputPath === 'string' ? outputPath : undefined, role);
+      await fs.promises.mkdir(path.dirname(capturePath), { recursive: true });
+      await fs.promises.writeFile(capturePath, bytes);
+      await writeWindowSidecar(capturePath, role, recording);
+    } catch (error) {
+      saveError = `Could not save the capture${capturePath ? ` to ${capturePath}` : ''}: ${errorMessage(error)}`;
+      capturePath = undefined;
+    }
+
+    const summary = await analyzeMicroProfilerCapture(bytes, {
+      ...analysisOptions,
+      targetRole: role,
+      window: windowFromRecording(recording),
+    });
+    summary.action = action;
+    Object.assign(summary, placement);
+    summary.capture = {
+      path: capturePath,
+      save_error: saveError,
+      bytes: bytes.length,
+      source: 'studio',
+      method: recording.method,
+      first_frame_wait_ms: recording.first_frame_wait_ms,
+      stream: recording.stream,
+      stopped_by: recording.stopped_by,
+    };
+    if (reply.capture_state !== undefined) summary.capture_state = reply.capture_state;
+    const recordingNotes = Array.isArray(recording.notes) ? recording.notes.filter((note): note is string => typeof note === 'string') : [];
+    const stream = asRecord(recording.stream);
+    const quality = asRecord(summary.data_quality);
+    if (quality) {
+      const reasons = Array.isArray(quality.partial_reasons) ? quality.partial_reasons as string[] : [];
+      if (stream?.size_limit_reached === true) reasons.push('stream_size_limit_reached');
+      if (recording.stopped_by === 'max_duration') reasons.push('recording_time_limit_reached');
+      quality.partial_reasons = reasons;
+      quality.partial = reasons.length > 0;
+      if (processRoles.length > 1) {
+        recordingNotes.push(`This Studio process runs ${processRoles.join(', ')}, and MicroProfiler records the whole process, so this capture includes the timers of every role in it${recordedBy !== role ? ` (it was recorded through the ${recordedBy} Peer)` : ''}. Label your own work with debug.profilebegin to tell roles apart, or use multiplayer_playtest for a separate process per role.`);
+      }
+      if (recordingNotes.length > 0) {
+        const notes = Array.isArray(quality.notes) ? quality.notes as string[] : [];
+        quality.notes = [...recordingNotes, ...notes];
+      }
+    }
+    return this._finishMicroProfilerResult(summary, finish);
+  }
+
+  // A result without an analysis still reaches summary_output_path, so a
+  // harness that reads the file sees why there is no analysis.
+  private _microProfilerFailure(body: Record<string, unknown>, summaryOutputPath: string | undefined) {
+    if (typeof summaryOutputPath === 'string' && summaryOutputPath !== '') {
+      const resolvedSummaryPath = path.resolve(summaryOutputPath);
+      fs.mkdirSync(path.dirname(resolvedSummaryPath), { recursive: true });
+      fs.writeFileSync(resolvedSummaryPath, JSON.stringify(body, null, 2), 'utf8');
+      body.summary_output_path = resolvedSummaryPath;
+    }
     return { content: [{ type: 'text', text: JSON.stringify(body) }] };
+  }
+
+  private _finishMicroProfilerResult(
+    summary: Record<string, unknown>,
+    options: {
+      summaryOutputPath?: string;
+      baselinePath?: unknown;
+      baseline?: unknown;
+      baselineLabel?: string;
+      currentLabel?: string;
+      maxComparisonRows?: number;
+      includeComparisonIndex: boolean;
+    },
+  ) {
+    // Re-analysis suggestions read the capture this result came from.
+    const capturePath = asRecord(summary.capture)?.path;
+    if (typeof capturePath === 'string') {
+      for (const recommendation of asRows(summary.recommended_tools)) {
+        const args = asRecord(recommendation.arguments);
+        if (recommendation.tool === 'capture_micro_profiler' && args?.action === 'analyze') args.input_path = capturePath;
+      }
+    }
+    const baselineCapture = loadMicroProfilerBaseline(options.baseline, options.baselinePath);
+    if (baselineCapture) {
+      summary.baseline_comparison = compareMicroProfilerCaptures(summary, baselineCapture, {
+        baselineLabel: options.baselineLabel,
+        currentLabel: options.currentLabel,
+        maxRows: options.maxComparisonRows,
+      });
+    }
+    if (typeof options.summaryOutputPath === 'string' && options.summaryOutputPath !== '') {
+      const resolvedSummaryPath = path.resolve(options.summaryOutputPath);
+      fs.mkdirSync(path.dirname(resolvedSummaryPath), { recursive: true });
+      fs.writeFileSync(resolvedSummaryPath, JSON.stringify(summary, null, 2), 'utf8');
+      summary.summary_output_path = resolvedSummaryPath;
+    }
+    if (!options.includeComparisonIndex) {
+      delete summary.comparison_index;
+    }
+    return { content: [{ type: 'text', text: JSON.stringify(summary) }] };
   }
 
   async breakpoints(action: string, request: Record<string, unknown> = {}, target?: string, instance_id?: string) {
@@ -4240,17 +4632,48 @@ export class RobloxStudioTools {
     if (wait_ms !== undefined && (!Number.isInteger(wait_ms) || wait_ms < 0 || wait_ms > MAX_OPERATION_WAIT_MS)) {
       throw new Error(`wait_ms must be an integer from 0 to ${MAX_OPERATION_WAIT_MS}`);
     }
-    return this._requestStatusResult(request_id, await this.bridge.getRequestStatusEverywhere(request_id, wait_ms ?? 0, signal));
+    const deadline = Date.now() + (wait_ms ?? 0);
+    // A generate_model job may still be preparing its reference image here,
+    // before the bridge holds any record of it.
+    if (this.referenceUploads.view(request_id)) {
+      await this.referenceUploads.waitForPreparation(request_id, wait_ms ?? 0, signal);
+      const preparation = this.referenceUploads.view(request_id);
+      if (preparation && preparation.stage !== 'dispatched') {
+        return this._textResult(this._preparationStatus(request_id, preparation));
+      }
+    }
+    const remainingMs = Math.max(0, deadline - Date.now());
+    return this._operationStatusResult(request_id, await this.bridge.getRequestStatusEverywhere(request_id, remainingMs, signal));
   }
 
   private _requestStatusResult(requestId: string, status: RequestStatus | undefined) {
-    if (status) return this._textResult({ ...status });
-    return this._textResult({
+    return this._textResult(status ? { ...status } : unretainedStatus(requestId));
+  }
+
+  // A bridge status, plus the reference-image preparation and an overall phase
+  // when this server prepared the operation for generate_model.
+  private _operationStatusResult(requestId: string, status: RequestStatus | undefined) {
+    const preparation = this.referenceUploads.view(requestId);
+    if (!preparation) return this._requestStatusResult(requestId, status);
+    if (!status) return this._textResult({ ...unretainedStatus(requestId), preparation });
+    return this._textResult({ ...status, phase: generationPhase(status), preparation });
+  }
+
+  // A generate_model job that has not reached the bridge, shaped like a request
+  // status. Its generation has not been sent, so it has not executed.
+  private _preparationStatus(requestId: string, preparation: ReferenceUploadView): Record<string, unknown> {
+    const failed = preparation.stage === 'upload_failed' || preparation.stage === 'upload_unknown' || preparation.error !== undefined;
+    return {
       requestId,
-      state: 'unknown',
-      outcome: 'unknown',
-      message: 'No retained operation record. It may have expired, been evicted, or belonged to an earlier server session. Do not infer that the mutation was not executed.',
-    });
+      targetPeerId: preparation.targetPeerId,
+      queuedAt: preparation.startedAt,
+      phase: failed ? 'failed' : preparation.stage === 'uploading' ? 'uploading' : 'preparing',
+      stage: 'preparing',
+      state: failed ? 'settled' : 'pending',
+      outcome: failed ? 'error' : 'pending',
+      executionOutcome: 'not_executed',
+      preparation,
+    };
   }
 
 
@@ -4374,7 +4797,13 @@ export class RobloxStudioTools {
     };
   }
 
-  async insertAsset(assetId: number, parentPath?: string, position?: { x: number; y: number; z: number }, instance_id?: string) {
+  async insertAsset(
+    assetId: number,
+    parentPath?: string,
+    position?: { x: number; y: number; z: number },
+    instance_id?: string,
+    operation_id?: string,
+  ) {
     if (!assetId) {
       throw new Error('Asset ID is required for insert_asset');
     }
@@ -4382,7 +4811,7 @@ export class RobloxStudioTools {
       assetId,
       parentPath: parentPath || 'game.Workspace',
       position
-    }, undefined, instance_id);
+    }, undefined, instance_id, undefined, undefined, operation_id);
     return {
       content: [{
         type: 'text',
@@ -4494,14 +4923,6 @@ export class RobloxStudioTools {
       throw new Error('async must be a boolean.');
     }
 
-    // Every upload mints a new asset ID, so a retry is identified by the
-    // reference image's content rather than by the dispatched payload.
-    let imageIdentity: unknown;
-    if (referencePng) {
-      image = { kind: 'asset', asset_id: await this.uploadGenerateModelReferenceImage(referencePng, instance_id) };
-      imageIdentity = { kind: 'png_sha256', sha256: createHash('sha256').update(referencePng).digest('hex') };
-    }
-
     const payload: Record<string, unknown> = {
       prompt,
       image,
@@ -4514,23 +4935,90 @@ export class RobloxStudioTools {
     if (!schemaGroups) {
       payload.schema = schema ?? 'Body1';
     }
-    const identity = imageIdentity === undefined ? undefined : { ...payload, image: imageIdentity };
-
-    if (request.async === true) {
-      // The job stays tied to this Peer and outlives the caller; timeout_ms only
-      // bounds how long the bridge holds it open. Observe it with get_request_status.
-      const status = await this._withSinglePeer('edit', instance_id, undefined, (targetPeerId) =>
-        this.client.submit('/api/generate-model', payload, targetPeerId, timeoutMs, operationId, identity));
-      return this._requestStatusResult(status.requestId, status);
+    const submit = request.async === true;
+    if (!referencePng) return this._dispatchGenerateModel(payload, instance_id, timeoutMs, submit, operationId, undefined);
+    const uploadUnavailable = this.referenceUploadUnavailable();
+    if (uploadUnavailable) throw new Error(uploadUnavailable);
+    // Route before preparing anything: a request that cannot reach an edit
+    // Peer must not upload an image first.
+    const targetPeerId = await this._resolveSinglePeer('edit', instance_id);
+    if (submit && !this.bridge.supportsPrimaryFeature('submit')) {
+      throw new Error('The primary MCP server cannot start a job that outlives the call; call without async, or restart that server on this version. Nothing was uploaded.');
     }
-    const response = await this._withSinglePeer('edit', instance_id, undefined, (targetPeerId) =>
-      this._requestPeer('/api/generate-model', payload, targetPeerId, timeoutMs, undefined, operationId, identity));
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify(response),
-      }],
+
+    // Every upload mints a new asset ID, so a retry is identified by the
+    // reference image's content rather than by the dispatched payload.
+    const png = referencePng;
+    const identity = { ...payload, image: { kind: 'png_sha256', sha256: createHash('sha256').update(png).digest('hex') } };
+    const attempt: ReferenceUploadAttempt = {
+      upload: (progress) => this.uploadGenerateModelReferenceImage(png, instance_id, progress),
+      resume: (checkpoint, progress) => this.resumeGenerateModelReferenceImage(checkpoint, instance_id, progress),
     };
+    if (operationId === undefined && !submit) {
+      // Nothing can retry a call without an operation ID, so nothing is shared.
+      payload.image = { kind: 'asset', asset_id: await attempt.upload(UNTRACKED_UPLOAD) };
+      return this._dispatchGenerateModel(payload, instance_id, timeoutMs, false, undefined, identity);
+    }
+
+    // An async job without a caller ID still needs one before its upload starts.
+    const jobId = operationId ?? randomUUID();
+    const identityKey = createHash('sha256').update(JSON.stringify({ endpoint: '/api/generate-model', identity })).digest('hex');
+    const prepared = this.referenceUploads.lookup(jobId, identityKey, targetPeerId);
+    if (operationId !== undefined && !prepared) {
+      // Another server's caller may already have started this operation on
+      // the bridge; rejoin it instead of uploading the image again.
+      const joined = await this.bridge.joinOperation('/api/generate-model', targetPeerId, jobId, identity);
+      if (joined && submit) return this._requestStatusResult(jobId, joined.status);
+      if (joined) return { content: [{ type: 'text', text: JSON.stringify(await joined.response()) }] };
+    }
+    let dispatchPeerId = targetPeerId;
+    const generate = async () => {
+      payload.image = { kind: 'asset', asset_id: await this.referenceUploads.acquire(jobId, identityKey, targetPeerId, attempt) };
+      return this._dispatchGenerateModel(payload, instance_id, timeoutMs, submit, jobId, identity, (peerId) => {
+        dispatchPeerId = peerId;
+        this.referenceUploads.dispatched(jobId, peerId);
+      });
+    };
+    // Checked again in the same turn that starts the work: a concurrent caller
+    // may have claimed this ID while the bridge was consulted.
+    const current = this.referenceUploads.lookup(jobId, identityKey, targetPeerId);
+    const job = generate();
+    this.referenceUploads.attach(jobId, job);
+    job.catch((error: unknown) => {
+      if (generationNotAdmitted(error)) this.referenceUploads.notDispatched(jobId, dispatchPeerId, error);
+    });
+    if (submit && current?.imageAssetId === undefined) {
+      // The job outlives this call from the moment its upload starts. Its
+      // progress and any failure are reported by get_request_status.
+      return this._textResult(this._preparationStatus(jobId, this.referenceUploads.view(jobId)!));
+    }
+    return job;
+  }
+
+  private _resolveSinglePeer(target: string, instance_id: string | undefined): Promise<string> {
+    return this._withSinglePeer(target, instance_id, undefined, async (targetPeerId) => targetPeerId);
+  }
+
+  private async _dispatchGenerateModel(
+    payload: Record<string, unknown>,
+    instance_id: string | undefined,
+    timeoutMs: number | undefined,
+    submit: boolean,
+    operationId: string | undefined,
+    identity: unknown,
+    onDispatch?: (targetPeerId: string) => void,
+  ) {
+    return this._withSinglePeer('edit', instance_id, undefined, async (targetPeerId) => {
+      onDispatch?.(targetPeerId);
+      if (submit) {
+        // The job stays tied to this Peer and outlives the caller; timeout_ms only
+        // bounds how long the bridge holds it open. Observe it with get_request_status.
+        const status = await this.client.submit('/api/generate-model', payload, targetPeerId, timeoutMs, operationId, identity);
+        return this._operationStatusResult(status.requestId, status);
+      }
+      const response = await this._requestPeer('/api/generate-model', payload, targetPeerId, timeoutMs, undefined, operationId, identity);
+      return { content: [{ type: 'text', text: JSON.stringify(response) }] };
+    });
   }
 
   async previewAsset(
@@ -4777,9 +5265,23 @@ export class RobloxStudioTools {
     throw new Error(`Reference image upload succeeded, but the backing image asset ID could not be resolved for Decal ${decalAssetId}.${suffix}`);
   }
 
+  // Why a reference image cannot be uploaded from this server, or undefined.
+  // Checked before a generation is routed, so it fails without starting a job.
+  private referenceUploadUnavailable(): string | undefined {
+    if (this.cookieClient.hasCookie()) return undefined;
+    if (!this.openCloudClient.hasApiKey()) {
+      return 'image_path and image_base64 require Roblox asset upload credentials because GenerateModelAsync only accepts rbxassetid:// or rbxasset:// image inputs. Set ROBLOX_OPEN_CLOUD_API_KEY plus ROBLOX_CREATOR_USER_ID or ROBLOX_CREATOR_GROUP_ID, or pass image_asset_id.';
+    }
+    if (!process.env.ROBLOX_CREATOR_USER_ID && !process.env.ROBLOX_CREATOR_GROUP_ID) {
+      return 'Creator identity required for image upload. Set ROBLOX_CREATOR_USER_ID or ROBLOX_CREATOR_GROUP_ID, or pass image_asset_id.';
+    }
+    return undefined;
+  }
+
   private async uploadGenerateModelReferenceImage(
     imageContent: Buffer,
-    instance_id?: string,
+    instance_id: string | undefined,
+    progress: ReferenceUploadProgress = UNTRACKED_UPLOAD,
   ): Promise<number> {
     if (this.cookieClient.hasCookie()) {
       const result = await this.cookieClient.uploadImage({
@@ -4789,23 +5291,16 @@ export class RobloxStudioTools {
         description: STUDIO_ASSISTANT_SOURCE_IMAGE_LABEL,
         userId: process.env.ROBLOX_CREATOR_USER_ID,
         groupId: process.env.ROBLOX_CREATOR_GROUP_ID,
+        onSending: () => progress.sending(),
+        onAccepted: (id) => progress.accepted({ provider: 'user_auth', id }),
       });
       return result.assetId;
     }
 
-    if (!this.openCloudClient.hasApiKey()) {
-      throw new Error(
-        'image_path and image_base64 require Roblox asset upload credentials because GenerateModelAsync only accepts rbxassetid:// or rbxasset:// image inputs. Set ROBLOX_OPEN_CLOUD_API_KEY plus ROBLOX_CREATOR_USER_ID or ROBLOX_CREATOR_GROUP_ID, or pass image_asset_id.'
-      );
-    }
-
+    const unavailable = this.referenceUploadUnavailable();
+    if (unavailable) throw new Error(unavailable);
     const resolvedGroupId = process.env.ROBLOX_CREATOR_GROUP_ID;
     const resolvedUserId = process.env.ROBLOX_CREATOR_USER_ID;
-    if (!resolvedUserId && !resolvedGroupId) {
-      throw new Error(
-        'Creator identity required for image upload. Set ROBLOX_CREATOR_USER_ID or ROBLOX_CREATOR_GROUP_ID, or pass image_asset_id.'
-      );
-    }
 
     const creator: { userId?: string; groupId?: string } = {};
     if (resolvedGroupId) {
@@ -4823,12 +5318,42 @@ export class RobloxStudioTools {
       },
       imageContent,
       'generate-model-reference.png',
+      {
+        onSending: () => progress.sending(),
+        onAccepted: (id) => progress.accepted({ provider: 'open_cloud', id }),
+      },
     );
+    return this.resolveCreatedReferenceDecal(result, instance_id, progress);
+  }
 
+  // Continues an upload Roblox already accepted, or resolves the image of a
+  // Decal it already created, without sending the image again.
+  private async resumeGenerateModelReferenceImage(
+    checkpoint: ReferenceUploadCheckpoint,
+    instance_id: string | undefined,
+    progress: ReferenceUploadProgress,
+  ): Promise<number> {
+    if (checkpoint.createdAssetId !== undefined) {
+      return this.resolveUploadedReferenceImageId(checkpoint.createdAssetId, instance_id);
+    }
+    const operation = checkpoint.remoteOperation;
+    if (!operation) throw new Error('A reference image upload can only be resumed from a remote operation.');
+    if (operation.provider === 'user_auth') {
+      return (await this.cookieClient.resumeImageUpload(operation.id)).assetId;
+    }
+    return this.resolveCreatedReferenceDecal(await this.openCloudClient.resumeAssetOperation(operation.id), instance_id, progress);
+  }
+
+  private async resolveCreatedReferenceDecal(
+    result: AssetOperationResponse,
+    instance_id: string | undefined,
+    progress: ReferenceUploadProgress,
+  ): Promise<number> {
     const decalId = result.response?.assetId;
     if (!decalId || !/^\d+$/.test(decalId)) {
       throw new Error('Reference image upload did not return an asset ID.');
     }
+    progress.created(decalId);
     return this.resolveUploadedReferenceImageId(decalId, instance_id);
   }
 
@@ -4840,11 +5365,15 @@ export class RobloxStudioTools {
     userId?: string,
     groupId?: string
   ) {
-    if (!fs.existsSync(filePath)) {
-      throw new Error(`File not found: ${filePath}`);
-    }
-
-    const fileContent = fs.readFileSync(filePath);
+    // Non-blocking and bounded: a FIFO cannot stall the server and an
+    // oversized file is rejected before it is read or uploaded.
+    const limitBytes = openCloudAssetUploadLimitBytes(assetType);
+    const fileContent = await readRegularFileWithinLimitAsync(filePath, 'File', (size) => {
+      if (size > limitBytes) {
+        const limit = assetType === 'Video' ? '3.75 GB' : '20 MB';
+        throw new Error(`File exceeds Roblox's ${limitBytes}-byte (${limit}) ${assetType} upload limit: ${filePath}`);
+      }
+    });
     const fileName = path.basename(filePath);
     const resolvedGroupId = groupId || process.env.ROBLOX_CREATOR_GROUP_ID;
     const resolvedUserId = userId || process.env.ROBLOX_CREATOR_USER_ID;
@@ -4985,8 +5514,10 @@ export class RobloxStudioTools {
       classFilter?: string;
       dryRun?: boolean;
       maxReplacements?: number;
+      expectedRevisions?: unknown;
     },
-    instance_id?: string
+    instance_id?: string,
+    operation_id?: string,
   ) {
     if (!pattern) {
       throw new Error('pattern is required for find_and_replace_in_scripts');
@@ -4994,55 +5525,26 @@ export class RobloxStudioTools {
     if (replacement === undefined || replacement === null) {
       throw new Error('replacement is required for find_and_replace_in_scripts');
     }
+    const { expectedRevisions: requestedRevisions, ...searchOptions } = options ?? {};
+    assertScriptClassFilter('find_and_replace_in_scripts', searchOptions.classFilter);
+    const { maxReplacements } = searchOptions;
+    if (maxReplacements !== undefined && (!Number.isInteger(maxReplacements) || maxReplacements < 1)) {
+      throw new Error('find_and_replace_in_scripts maxReplacements must be a positive integer');
+    }
+    const expectedRevisions = optionalRevisionMap('find_and_replace_in_scripts', requestedRevisions);
     const response = await this._callSingle('/api/find-and-replace-in-scripts', {
       pattern,
       replacement,
-      ...options
-    }, undefined, instance_id);
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify(response)
-      }]
-    };
+      ...searchOptions,
+      ...(expectedRevisions === undefined ? {} : { expectedRevisions }),
+    }, undefined, instance_id, undefined, undefined, operation_id);
+    return this._textResult(response);
   }
 
   async getMemoryBreakdown(target?: string, tags?: string[], instance_id?: string) {
     const data: Record<string, unknown> = {};
     if (tags !== undefined) data.tags = tags;
-
-    const refresh = this.bridge.refreshTopologyForRouting();
-    if (refresh) await refresh;
-    const tgt = this._targetForInstanceId(instance_id, { requested: target, fallback: 'all', accepts: anyRole });
-    const resolved = this.bridge.resolveTarget({ instance_id, target: tgt });
-    if (!resolved.ok) throw new RoutingFailure(resolved.error);
-
-    if (resolved.mode === 'single') {
-      const response = await this._requestPeer('/api/get-memory-breakdown', data, resolved.targetPeerId);
-      return { content: [{ type: 'text', text: JSON.stringify(response) }] };
-    }
-
-    const targets = resolved.targets;
-
-    const responses = await Promise.allSettled(
-      targets.map(async (t) => ({
-        peer: t.targetRole,
-        result: await this._requestPeer('/api/get-memory-breakdown', data, t.targetPeerId),
-      })),
-    );
-
-    const body: Record<string, unknown> = {};
-    for (let i = 0; i < responses.length; i++) {
-      const r = responses[i];
-      const peer = targets[i].targetRole;
-      if (r.status === 'fulfilled') {
-        body[peer] = r.value.result;
-      } else {
-        body[peer] = { error: 'disconnected' };
-      }
-    }
-
-    return { content: [{ type: 'text', text: JSON.stringify(body) }] };
+    return this._readPeerOrFanOut('/api/get-memory-breakdown', data, target, instance_id);
   }
 
   async getSceneAnalysis(mode?: string, target?: string, topN?: number, raw?: boolean, instance_id?: string) {
@@ -5050,7 +5552,13 @@ export class RobloxStudioTools {
     if (mode !== undefined) data.mode = mode;
     if (topN !== undefined) data.topN = topN;
     if (raw !== undefined) data.raw = raw;
+    return this._readPeerOrFanOut('/api/get-scene-analysis', data, target, instance_id);
+  }
 
+  // One Peer returns its response as is. A fanout keys each Peer's response by
+  // role and classifies it here, from the request outcome and the response
+  // envelope only: data nested inside a successful response is never inspected.
+  private async _readPeerOrFanOut(endpoint: string, data: Record<string, unknown>, target: string | undefined, instance_id: string | undefined) {
     const refresh = this.bridge.refreshTopologyForRouting();
     if (refresh) await refresh;
     const tgt = this._targetForInstanceId(instance_id, { requested: target, fallback: 'all', accepts: anyRole });
@@ -5058,31 +5566,37 @@ export class RobloxStudioTools {
     if (!resolved.ok) throw new RoutingFailure(resolved.error);
 
     if (resolved.mode === 'single') {
-      const response = await this._requestPeer('/api/get-scene-analysis', data, resolved.targetPeerId);
-      return { content: [{ type: 'text', text: JSON.stringify(response) }] };
+      return this._textResult(await this._requestPeer(endpoint, data, resolved.targetPeerId));
     }
 
-    const targets = resolved.targets;
-
+    const { targets } = resolved;
     const responses = await Promise.allSettled(
-      targets.map(async (t) => ({
-        peer: t.targetRole,
-        result: await this._requestPeer('/api/get-scene-analysis', data, t.targetPeerId),
-      })),
+      targets.map((peer) => this._requestPeer(endpoint, data, peer.targetPeerId)),
     );
-
-    const body: Record<string, unknown> = {};
-    for (let i = 0; i < responses.length; i++) {
-      const r = responses[i];
-      const peer = targets[i].targetRole;
-      if (r.status === 'fulfilled') {
-        body[peer] = r.value.result;
+    const peers: Record<string, unknown> = {};
+    const failures: string[] = [];
+    responses.forEach((response, index) => {
+      const role = targets[index].targetRole;
+      if (response.status === 'rejected') {
+        const failure = peerRequestFailure(response.reason);
+        peers[role] = failure;
+        failures.push(`${role}: ${failure.error}`);
       } else {
-        body[peer] = { error: 'disconnected' };
+        peers[role] = response.value;
+        const handlerError = asRecord(response.value)?.error;
+        if (typeof handlerError === 'string') failures.push(`${role}: ${boundedMessage(handlerError)}`);
       }
+    });
+    const summary = { requested: targets.length, succeeded: targets.length - failures.length, failed: failures.length };
+    if (summary.succeeded === 0) {
+      return this._textResult({
+        error: 'all_peers_failed',
+        message: boundedMessage(`Every Peer failed: ${failures.join('; ')}`),
+        summary,
+        ...peers,
+      });
     }
-
-    return { content: [{ type: 'text', text: JSON.stringify(body) }] };
+    return this._textResult({ ...(summary.failed > 0 ? { partial: true } : {}), summary, ...peers });
   }
 
   async exportRbxm(instancePaths: string[], outputPath: string, target?: string, instance_id?: string) {
@@ -5139,6 +5653,7 @@ export class RobloxStudioTools {
     target?: string,
     instance_id?: string,
     signal?: AbortSignal,
+    operation_id?: string,
   ) {
     if (!source || typeof source !== 'object') {
       throw new Error('source is required for import_rbxm');
@@ -5154,6 +5669,10 @@ export class RobloxStudioTools {
     if (modes.length !== 1) {
       throw new Error(`source must contain exactly one of { path, url, base64 } (got: ${modes.join(', ') || 'none'})`);
     }
+    // Checked before the input is read; the bridge would reject it only after.
+    if (operation_id !== undefined && !isValidOperationId(operation_id)) {
+      throw new Error(`operation_id must be a nonblank string of at most ${MAX_OPERATION_ID_LENGTH} characters.`);
+    }
 
     let input: Awaited<ReturnType<typeof readRbxmInput>>;
     try {
@@ -5162,7 +5681,8 @@ export class RobloxStudioTools {
       return this._textResult({ error: error instanceof Error ? error.message : String(error) });
     }
     const { bytes, sourceLabel } = input;
-
+    // The payload carries the bytes read, so a retry under the same operation_id
+    // recovers the first result only when the file or URL still holds them.
     const response = await this._callSingle(
       '/api/import-rbxm',
       {
@@ -5174,6 +5694,7 @@ export class RobloxStudioTools {
       instance_id,
       undefined,
       signal,
+      operation_id,
     );
 
     return { content: [{ type: 'text', text: JSON.stringify(response) }] };

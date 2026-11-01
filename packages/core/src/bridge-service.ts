@@ -215,6 +215,18 @@ export class RequestFailure extends Error {
   }
 }
 
+/** A Studio handler's structured refusal, e.g. `{ success: false, error: 'service_unavailable' }`. */
+export class StudioOperationError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+    readonly details: Record<string, unknown> = {},
+  ) {
+    super(message);
+    this.name = 'StudioOperationError';
+  }
+}
+
 export function parseObservations(value: object): RequestObservations {
   const result: RequestObservations = {};
   if ('executionOutcome' in value) {
@@ -272,6 +284,58 @@ export function isValidOperationId(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= MAX_OPERATION_ID_LENGTH;
 }
 
+/**
+ * Proxy-protocol features this server honours as a primary, advertised in
+ * /topology. An older primary silently ignores the fields behind them, so a
+ * proxy must not use one its primary does not list.
+ *   submit: /proxy answers `submit: true` at admission instead of on completion.
+ *   identity: /proxy fingerprints operations by `identity` instead of payload.
+ *   status_wait: /request-status honours `waitMs`.
+ *   script_preconditions: Studio plugins must match their primary's version, so
+ *     this primary's plugins enforce expectedRevision(s) on script writes. An
+ *     older plugin ignores those fields and writes unchecked.
+ *   simulation_reads: this primary's plugins serve the fixed network and device
+ *     simulator reads (/api/get-network-simulation-state,
+ *     /api/get-device-simulator-state). Older plugins only offer them as
+ *     generated Luau, which an Inspector primary's /proxy forbids.
+ *   atomic_properties: this primary's plugins honour `atomic` and `dryRun` on
+ *     /api/set-properties. An older plugin ignores both and writes each
+ *     property separately, even for a preview.
+ *   micro_profiler_transfer: this primary's plugins record MicroProfiler
+ *     captures and stage them for /api/micro-profiler-read. An older plugin
+ *     analyzes in Studio and stages nothing this server can read.
+ */
+export const PRIMARY_PROXY_FEATURES = ['submit', 'identity', 'status_wait', 'script_preconditions', 'simulation_reads', 'atomic_properties', 'micro_profiler_transfer'] as const;
+export type PrimaryProxyFeature = typeof PRIMARY_PROXY_FEATURES[number];
+
+const REVISION_CHECKED_SCRIPT_ENDPOINTS = new Set([
+  '/api/set-script-source',
+  '/api/insert-script-lines',
+  '/api/delete-script-lines',
+]);
+
+/**
+ * True for a script write that carries a revision precondition, which only
+ * a script_preconditions primary's plugin enforces. Requests without one, and
+ * find-and-replace previews, behave as they did on older plugins.
+ */
+export function requiresScriptPreconditions(endpoint: string, data: unknown): boolean {
+  if (!data || typeof data !== 'object') return false;
+  if (endpoint === '/api/find-and-replace-in-scripts') {
+    return 'expectedRevisions' in data && !('dryRun' in data && data.dryRun === true);
+  }
+  return REVISION_CHECKED_SCRIPT_ENDPOINTS.has(endpoint) && 'expectedRevision' in data;
+}
+
+/**
+ * True for a set_properties request that asks for atomic mode or a preview,
+ * which only an atomic_properties primary's plugin honours.
+ */
+export function requiresAtomicProperties(endpoint: string, data: unknown): boolean {
+  if (endpoint !== '/api/set-properties' || !data || typeof data !== 'object') return false;
+  return ('atomic' in data && data.atomic === true) || ('dryRun' in data && data.dryRun === true);
+}
+
 interface OperationRecord {
   status: RequestStatus;
   fingerprint: string;
@@ -303,6 +367,13 @@ type RequestAdmission =
   | { kind: 'rejected'; failure: RequestFailure }
   | { kind: 'pending'; requestId: string; request: PendingRequest }
   | { kind: 'retained'; requestId: string; status: RequestStatus };
+
+/** An operation found by BridgeService.joinOperation. */
+export interface JoinedOperation {
+  status: RequestStatus;
+  /** Waits on the operation, or replays its retained outcome, as an identical retry would. */
+  response(): Promise<unknown>;
+}
 
 interface PendingCancellation extends StudioRequestCancellation {
   transportPeerId: string;
@@ -433,8 +504,9 @@ export class BridgeService implements StudioTransportQueue {
   private retainedResultBytes = 0;
   private pendingRequestBytes = 0;
   private readonly pendingCancellations = new Map<string, PendingCancellation>();
-  // Status waits end on settlement; they never own or cancel the operation.
-  private readonly settlementWaiters = new Map<string, Set<() => void>>();
+  // Status waits wake on every lifecycle transition and re-check; they never
+  // own or cancel the operation.
+  private readonly lifecycleWaiters = new Map<string, Set<() => void>>();
   private readonly peersById = new Map<string, StudioPeer>();
   private readonly multiplayerGroupsById = new Map<string, MultiplayerGroup>();
   private readonly peerRegisteredListeners = new Set<PeerRegisteredListener>();
@@ -926,6 +998,11 @@ export class BridgeService implements StudioTransportQueue {
     return undefined;
   }
 
+  /** A local primary's plugins match its version, so it supports every feature it advertises. */
+  supportsPrimaryFeature(feature: PrimaryProxyFeature): boolean {
+    return PRIMARY_PROXY_FEATURES.includes(feature);
+  }
+
   resolveConnectedInstanceId(instanceId: string): string | undefined {
     const exact = this.getInstances().find((instance) => instance.id === instanceId);
     const groupedRuntime = this.getPeers().find((peer) =>
@@ -1135,6 +1212,47 @@ export class BridgeService implements StudioTransportQueue {
     return Promise.resolve(this.getRequestStatus(admission.requestId)!);
   }
 
+  /**
+   * Rejoins the operation already admitted under operationId exactly as an
+   * identical retry would, but never admits new work: resolves undefined when
+   * no such operation is retained. A caller whose payload is costly to prepare
+   * (for example, an asset upload) checks here before preparing it.
+   */
+  joinOperation(endpoint: string, targetPeerId: string, operationId: string, identity: unknown): Promise<JoinedOperation | undefined> {
+    let fingerprint: string;
+    try {
+      fingerprint = this.operationFingerprint(targetPeerId, endpoint, undefined, identity);
+    } catch {
+      return Promise.reject(new RequestFailure(`Request ${operationId} cannot be serialized; queued; not_executed`, 'request_serialization_failed', {
+        requestId: operationId, targetPeerId, stage: 'queued', outcome: 'not_executed', executionOutcome: 'not_executed',
+      }));
+    }
+    this.pruneOperations(Date.now());
+    const existing = this.operations.get(operationId);
+    if (!existing) return Promise.resolve(undefined);
+    if (existing.fingerprint !== fingerprint) return Promise.reject(this.operationCollision(operationId, existing));
+    const status = this.getRequestStatus(operationId)!;
+    const pending = this.pendingRequests.get(operationId);
+    return Promise.resolve({
+      status,
+      response: () => pending ? pending.promise : this.replayRetained(status, targetPeerId),
+    });
+  }
+
+  private operationFingerprint(targetPeerId: string, endpoint: string, data: unknown, identity: unknown): string {
+    return createHash('sha256').update(JSON.stringify(
+      identity === undefined ? { targetPeerId, endpoint, data } : { targetPeerId, endpoint, identity },
+    )).digest('hex');
+  }
+
+  private operationCollision(requestId: string, existing: OperationRecord): RequestFailure {
+    return new RequestFailure(
+      `Request ${requestId} already identifies a different operation; existing operation ${existing.status.stage}; not replayed`,
+      'operation_id_collision',
+      { requestId, targetPeerId: existing.status.targetPeerId, stage: existing.status.stage, outcome: 'unknown', ...observations(existing.status) },
+    );
+  }
+
   // An operation's identity defaults to its payload. Callers whose dispatched
   // payload is not reproducible on retry (for example, a freshly uploaded asset
   // ID) supply the identity of their arguments instead.
@@ -1161,9 +1279,7 @@ export class BridgeService implements StudioTransportQueue {
     let fingerprint: string;
     try {
       const target = this.getPeerById(targetPeerId);
-      fingerprint = createHash('sha256').update(JSON.stringify(
-        identity === undefined ? { targetPeerId, endpoint, data } : { targetPeerId, endpoint, identity },
-      )).digest('hex');
+      fingerprint = this.operationFingerprint(targetPeerId, endpoint, data, identity);
       requestBytes = Buffer.byteLength(JSON.stringify({
         kind: 'request', requestId, peerId: targetPeerId, target: target?.role,
         endpoint, data: data ?? null, remainingMs: effectiveTimeoutMs,
@@ -1174,13 +1290,7 @@ export class BridgeService implements StudioTransportQueue {
     this.pruneOperations(Date.now());
     const existing = this.operations.get(requestId);
     if (existing) {
-      if (existing.fingerprint !== fingerprint) {
-        return reject(new RequestFailure(
-          `Request ${requestId} already identifies a different operation; existing operation ${existing.status.stage}; not replayed`,
-          'operation_id_collision',
-          { requestId, targetPeerId: existing.status.targetPeerId, stage: existing.status.stage, outcome: 'unknown', ...observations(existing.status) },
-        ));
-      }
+      if (existing.fingerprint !== fingerprint) return reject(this.operationCollision(requestId, existing));
       const pending = this.pendingRequests.get(requestId);
       if (pending) return { kind: 'pending', requestId, request: pending };
       return { kind: 'retained', requestId, status: this.getRequestStatus(requestId)! };
@@ -1266,6 +1376,7 @@ export class BridgeService implements StudioTransportQueue {
       operation.updatedAt = Date.now();
       this.operations.delete(request.id);
       this.operations.set(request.id, operation);
+      this.notifyLifecycleWaiters(request.id);
     }
     if (state !== 'disconnected') {
       this.notifyRequestCancelled(request, state === 'timed_out' ? 'timeout' : 'aborted');
@@ -1468,7 +1579,7 @@ export class BridgeService implements StudioTransportQueue {
       else request.resolve(response);
     }
     this.pendingCancellations.delete(requestId);
-    for (const notify of this.settlementWaiters.get(requestId) ?? []) notify();
+    this.notifyLifecycleWaiters(requestId);
     this.pruneOperations(now);
     if (operation.transportPeerId) this.notifyRequestAvailable(operation.transportPeerId);
     return 'accepted';
@@ -1490,30 +1601,51 @@ export class BridgeService implements StudioTransportQueue {
     return status;
   }
 
+  private notifyLifecycleWaiters(requestId: string): void {
+    for (const notify of this.lifecycleWaiters.get(requestId) ?? []) notify();
+  }
+
+  // A late Studio response can settle only an operation Studio picked up; one
+  // whose waiter ended while it was still queued was never sent and never will be.
+  private canStillSettle(requestId: string): boolean {
+    this.pruneOperations(Date.now());
+    const operation = this.operations.get(requestId);
+    if (!operation || operation.status.state === 'settled') return false;
+    return operation.status.state === 'pending' || operation.transportPeerId !== undefined;
+  }
+
   /**
-   * Returns the retained status, first waiting up to waitMs for a pending,
-   * timed-out, aborted, or disconnected operation to settle. A late Studio
-   * response can still settle those. The wait ends on settlement, deadline, or
-   * signal; ending it never cancels or rolls back the operation.
+   * Returns the retained status, first waiting up to waitMs while the operation
+   * can still settle: while it is pending, or after a timeout, abort, or
+   * disconnect once Studio had picked it up, since a late Studio response can
+   * still settle it. An operation that can no longer settle returns at once, or
+   * as soon as it gets there. The wait also ends on its deadline or signal;
+   * ending it never cancels or rolls back the operation.
    */
   async waitForRequestStatus(requestId: string, waitMs = 0, signal?: AbortSignal): Promise<RequestStatus | undefined> {
-    const status = this.getRequestStatus(requestId);
     const boundedWaitMs = Math.min(Math.max(0, waitMs), MAX_OPERATION_WAIT_MS);
-    if (!status || status.state === 'settled' || boundedWaitMs === 0 || signal?.aborted) return status;
-    const { promise, resolve } = Promise.withResolvers<void>();
-    const notify = () => resolve();
-    let waiters = this.settlementWaiters.get(requestId);
-    if (!waiters) this.settlementWaiters.set(requestId, waiters = new Set());
-    waiters.add(notify);
-    const timeoutId = setTimeout(notify, boundedWaitMs);
-    signal?.addEventListener('abort', notify, { once: true });
+    if (boundedWaitMs === 0 || signal?.aborted || !this.canStillSettle(requestId)) return this.getRequestStatus(requestId);
+    const { promise: deadline, resolve: endWait } = Promise.withResolvers<'deadline'>();
+    const reachDeadline = () => endWait('deadline');
+    const timeoutId = setTimeout(reachDeadline, boundedWaitMs);
+    signal?.addEventListener('abort', reachDeadline, { once: true });
+    let waiters = this.lifecycleWaiters.get(requestId);
+    if (!waiters) this.lifecycleWaiters.set(requestId, waiters = new Set());
     try {
-      await promise;
+      while (this.canStillSettle(requestId)) {
+        const { promise: transition, resolve: wake } = Promise.withResolvers<'transition'>();
+        const notify = () => wake('transition');
+        waiters.add(notify);
+        try {
+          if (await Promise.race([transition, deadline]) === 'deadline') break;
+        } finally {
+          waiters.delete(notify);
+        }
+      }
     } finally {
       clearTimeout(timeoutId);
-      signal?.removeEventListener('abort', notify);
-      waiters.delete(notify);
-      if (waiters.size === 0) this.settlementWaiters.delete(requestId);
+      signal?.removeEventListener('abort', reachDeadline);
+      if (waiters.size === 0) this.lifecycleWaiters.delete(requestId);
     }
     return this.getRequestStatus(requestId);
   }
@@ -1529,6 +1661,7 @@ export class BridgeService implements StudioTransportQueue {
       this.operations.delete(requestId);
       this.retainedResults.delete(requestId);
       this.retainedResultBytes -= operation.resultBytes;
+      this.notifyLifecycleWaiters(requestId);
     }
     while (this.operations.size > MAX_OPERATION_RECORDS) {
       let removed = false;
@@ -1537,6 +1670,7 @@ export class BridgeService implements StudioTransportQueue {
         this.operations.delete(requestId);
         this.retainedResults.delete(requestId);
         this.retainedResultBytes -= operation.resultBytes;
+        this.notifyLifecycleWaiters(requestId);
         removed = true;
         break;
       }

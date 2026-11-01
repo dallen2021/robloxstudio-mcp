@@ -293,12 +293,14 @@ describe('MCP v2 tool runtime', () => {
     const serialized = JSON.stringify(catalog);
     const inspectorCatalog = getReadOnlyTools().map(publicToolDefinition);
 
-    expect(catalog).toHaveLength(52); // dallen fork: +pin_place, read_datastore, list_datastore_keys
-    expect(serialized.length).toBeLessThanOrEqual(48_500);
-    expect(catalog.filter((tool) => tool.outputSchema)).toHaveLength(51);
+    expect(catalog).toHaveLength(53); // dallen fork: +pin_place, read_datastore, list_datastore_keys
+    // 51,000 admits operation_id on every recoverable Studio write and
+    // expected_revision(s) on script writes (about 1,600 characters).
+    expect(serialized.length).toBeLessThanOrEqual(53_000); // dallen fork: +2,000 for pin_place and the DataStore reads
+    expect(catalog.filter((tool) => tool.outputSchema)).toHaveLength(52); // dallen fork tools
     expect(catalog.every((tool) => tool.description.length <= 120)).toBe(true);
     expect(inspectorCatalog).toHaveLength(28);
-    expect(JSON.stringify(inspectorCatalog).length).toBeLessThanOrEqual(22_500); // dallen fork tools
+    expect(JSON.stringify(inspectorCatalog).length).toBeLessThanOrEqual(23_000); // dallen fork: upstream 21,000 + 2,000 for our tools
     expect(byName.get('selection')?.outputSchema).toEqual({
       type: 'object',
       additionalProperties: true,
@@ -367,6 +369,12 @@ describe('MCP v2 tool runtime', () => {
       openWorldHint: true,
     });
     expect(byName.get('manage_monetization')?.annotations).toMatchObject({
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    });
+    expect(byName.get('manage_experience')?.annotations).toMatchObject({
       readOnlyHint: false,
       destructiveHint: true,
       idempotentHint: false,

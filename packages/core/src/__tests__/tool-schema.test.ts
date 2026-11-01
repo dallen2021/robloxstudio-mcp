@@ -296,6 +296,7 @@ describe('Tool schema compatibility', () => {
       capture_device_matrix: 'captureDeviceMatrix',
       manage_instance: 'manageInstance',
       manage_monetization: 'manageMonetization',
+      manage_experience: 'manageExperience',
       solo_playtest: 'soloPlaytest',
       multiplayer_playtest: 'multiplayerPlaytest',
       get_runtime_logs: 'getRuntimeLogs',
@@ -449,6 +450,47 @@ describe('Tool schema compatibility', () => {
     expect(TOOL_GUIDE_MARKDOWN).toContain('create refuses a name that already exists');
   });
 
+  test('manage_experience exposes guarded experience and place settings', () => {
+    const tool = TOOL_DEFINITIONS.find((t) => t.name === 'manage_experience');
+    expect(tool?.category).toBe('write');
+    const schema = tool?.inputSchema ?? {};
+    expect(schema).toMatchObject({
+      required: ['action'],
+      properties: {
+        action: { type: 'string', enum: ['get', 'update'] },
+        universe_id: { type: 'integer', minimum: 1 },
+        place_id: { type: 'integer', minimum: 1 },
+        server_size: { type: 'integer', minimum: 1 },
+        private_server_price: { type: 'integer', minimum: 0, maximum: 1_000_000_000 },
+        confirm: { type: 'boolean' },
+        remove_social_links: {
+          type: 'array',
+          items: { enum: ['facebook', 'twitter', 'youtube', 'twitch', 'discord', 'roblox_group', 'guilded'] },
+        },
+      },
+    });
+    const properties: unknown = Reflect.get(schema, 'properties');
+    expect(Object.keys(properties ?? {}).sort()).toEqual([
+      'action',
+      'confirm',
+      'description',
+      'devices',
+      'disable_private_servers',
+      'instance_id',
+      'name',
+      'place_id',
+      'private_server_price',
+      'remove_social_links',
+      'server_size',
+      'social_links',
+      'universe_id',
+      'voice_chat_enabled',
+    ]);
+    expect(getReadOnlyTools().map((t) => t.name)).not.toContain('manage_experience');
+    expect(TOOL_GUIDE_MARKDOWN).toContain('Roblox refuses place edits while the place is open in an active Team Create session');
+    expect(TOOL_GUIDE_MARKDOWN).toContain('manage_experience cannot make an experience public or private');
+  });
+
   test('breakpoints schema exposes lifecycle actions and log fields', () => {
     const tool = TOOL_DEFINITIONS.find((t) => t.name === 'breakpoints');
     expect(tool).toBeTruthy();
@@ -519,29 +561,34 @@ describe('Tool schema compatibility', () => {
     const schema = tool!.inputSchema as { properties?: Record<string, unknown> };
     const props = schema.properties ?? {};
     expect(Object.keys(props).sort()).toEqual([
+      'action',
       'baseline',
       'baseline_label',
       'baseline_path',
       'current_label',
       'duration_ms',
+      'end_frame',
       'filter',
       'focus',
-      'frame_window',
       'include_comparison_index',
       'include_gpu',
       'include_idle',
+      'input_path',
       'instance_id',
       'max_comparison_rows',
-      'max_events',
       'max_groups',
       'max_related_timers',
       'max_timers',
       'max_timers_per_group',
       'min_total_us',
       'output_path',
+      'spike_frames',
+      'start_frame',
       'summary_output_path',
       'target',
     ].sort());
+    expect((props.action as { enum?: string[]; default?: string }).enum).toEqual(['capture', 'start', 'stop', 'analyze']);
+    expect((props.action as { enum?: string[]; default?: string }).default).toBe('capture');
     expect(tool!.category).toBe('read');
     expect(tool!.description).toMatch(/^Use /);
     expect(TOOL_GUIDE_MARKDOWN).toContain('capture_micro_profiler attributes frame time');
@@ -550,7 +597,7 @@ describe('Tool schema compatibility', () => {
     expect((props.target as { pattern?: string }).pattern).toBe('^(server|client-[0-9]+)$');
     expect((props.duration_ms as { default?: number; minimum?: number; maximum?: number }).default).toBe(1000);
     expect((props.duration_ms as { default?: number; minimum?: number; maximum?: number }).minimum).toBe(100);
-    expect((props.duration_ms as { default?: number; minimum?: number; maximum?: number }).maximum).toBe(5000);
+    expect((props.duration_ms as { default?: number; minimum?: number; maximum?: number }).maximum).toBe(30000);
     expect((props.focus as { enum?: string[]; default?: string }).enum).toEqual(['all', 'script', 'physics', 'render', 'network', 'jobs']);
     expect((props.focus as { enum?: string[]; default?: string }).default).toBe('all');
     expect((props.max_timers as { default?: number; minimum?: number; maximum?: number }).default).toBe(20);
@@ -565,10 +612,14 @@ describe('Tool schema compatibility', () => {
     expect((props.max_related_timers as { default?: number; minimum?: number; maximum?: number }).default).toBe(3);
     expect((props.max_related_timers as { default?: number; minimum?: number; maximum?: number }).minimum).toBe(0);
     expect((props.max_related_timers as { default?: number; minimum?: number; maximum?: number }).maximum).toBe(10);
-    expect((props.max_events as { default?: number; minimum?: number; maximum?: number }).default).toBe(250000);
-    expect((props.max_events as { default?: number; minimum?: number; maximum?: number }).minimum).toBe(10000);
-    expect((props.max_events as { default?: number; minimum?: number; maximum?: number }).maximum).toBe(1000000);
-    expect((props.output_path as { description?: string }).description).toContain('Raw snapshot file');
+    // The default depends on filter (3 without, 0 with), so the schema states it in words.
+    expect((props.spike_frames as { default?: number; description?: string }).default).toBeUndefined();
+    expect((props.spike_frames as { description?: string }).description).toContain('0 with filter');
+    expect((props.spike_frames as { default?: number; minimum?: number; maximum?: number }).maximum).toBe(10);
+    expect((props.input_path as { description?: string }).description).toContain('.gprx');
+    expect((props.output_path as { description?: string }).description).toContain('Capture file');
+    expect(TOOL_GUIDE_MARKDOWN).toContain('action=start');
+    expect(TOOL_GUIDE_MARKDOWN).toContain('action=analyze');
     expect((props.summary_output_path as { description?: string }).description).toContain('comparison index');
     expect((props.baseline_path as { description?: string }).description).toContain('baseline');
   });

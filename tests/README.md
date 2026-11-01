@@ -20,7 +20,7 @@ state it starts.
 ## Run
 
 GitHub Actions runs lint, typechecking, server builds, plugin compilation, and
-`npm test` on Windows and Linux with Node 22. These checks do not launch Studio.
+`npm test` on Windows, Linux, and macOS with Node 22. These checks do not launch Studio.
 Run `npm run build` before `npm test` or `npm run test:package-contents`: the
 package checks also exercise both built CLIs from relocated fixture packages,
 with plugin installation redirected to temporary directories.
@@ -69,7 +69,7 @@ The runner stops at the first failure and reports remaining checks as not run.
 | WebSocket progress, response loss/recovery, or multi-Studio capacity | `npm run test:studio:websocket-recovery` and `npm run test:studio:websocket-capacity` |
 | Plugin reconnect, registration deadlines, or listener replacement | `npm run test:studio:websocket-reconnect` |
 | Play-server shutdown, peer unregistration, or plugin HTTP requests | `npm run test:studio:shutdown-http-slots` |
-| Release | `npm run test:e2e:full`, plus affected standalone payload/WebSocket probes above |
+| Release | `npm run test:e2e:full`, plus affected standalone payload/WebSocket probes above; then `npm run publish:all` (see [Publishing a release](#publishing-a-release)) |
 
 When `MCP_INSTANCE_ID` is unset, the runner starts the built MCP server as the
 required primary on the configured port and gives it a random, run-scoped auth
@@ -276,6 +276,59 @@ npm run test:codex-wrapper
 Each test prints `✅ PASSED` or `❌ FAILED` plus the failing assertion. On
 failure the test's MCP subprocess stderr tail is dumped for context.
 
+## Publishing a release
+
+`npm run publish:all` publishes only tarballs that passed the full gate. It
+never edits `package.json`, builds, or installs plugins:
+
+```bash
+npm run release:sync-versions -- 3.5.0   # root, workspaces, and package-lock.json
+git commit -am "chore: release v3.5.0"   # the gate must run on a clean commit
+npm run test:e2e:full                    # writes release/release-record.json
+npm run release:verify                   # optional: check the evidence only
+npm run publish:all                      # npm publish each recorded tarball
+```
+
+For `tests/run-release.mjs` in a managed snapshot, the launcher records the
+source commit and whether the worktree was clean before and after export. The
+dedicated account only sees the snapshot, so it cannot supply these facts.
+The auto-install stage copies the exact local-pack tarballs it installs and
+tests. The runner writes a record whether the gate passes or fails. It holds the
+package names, versions, tarball names, SHA-256 hashes, and sizes. It also holds
+the OS, Node, npm, and Studio versions (`unknown` when not determinable), each
+stage as passed, failed, or skipped, the overall result, and a timestamp. The
+launcher then copies the record and tarballs into the gitignored `release/`
+directory before deleting the snapshot. A new gate run removes the previous
+evidence first. A run with an explicit `--repo` writes no record.
+
+`publish:all` refuses unless all of these hold:
+
+- The record's commit is `HEAD`.
+- The current tree and the gate's source were both clean.
+- All `package.json` versions match each other and the tested tarballs.
+- The result passed, with every stage passed and none failed or skipped.
+- Each tarball exists, its SHA-256 and size match the record, and its own
+  `package.json` has the recorded name and version.
+- The record is at most 7 days old.
+
+Every failed check is reported by name. In an emergency, bypass the checks
+explicitly:
+
+```bash
+npm run publish:all -- --emergency-override --reason "Why the gate cannot run"
+```
+
+The override prints every bypassed check. Before publishing, it appends the
+timestamp, user, reason, commit, tree state, versions, bypassed checks, and
+tarball hashes to the tracked `release/overrides.jsonl`; commit that entry. It
+publishes the recorded tarballs when they are intact. Otherwise it packs fresh
+ones after an artifact-only build, which never touches Studio's Plugins folder.
+Add `--dry-run` to report the outcome without logging or publishing.
+
+Attach the tested plugins to the GitHub release from the recorded tarballs
+(`package/studio-plugin/*.rbxmx` inside each file under `release/artifacts/`),
+not from a fresh build.
+
 ## Creator Store sanitizer unit test
 
 The Creator Store import sanitizer has a separate Node-side behavioral suite
@@ -373,6 +426,12 @@ node scripts/studio-lifecycle.mjs wait-connected --variant main --version <expec
 | `execute-luau-output-capture.mjs` | `execute_luau target=server` captures user `print()` and `warn()` calls in the response `output` array, matching the `target=edit` baseline; live structured `LogService` context is returned as `get_runtime_logs` entry `data` |
 | `multiplayer-add-player-end-regression.mjs` | Starts one multiplayer client, adds a second client, and verifies `EndTest` disconnects both runtime peers |
 | `multiplayer-test-lifecycle.mjs` | `multiplayer_test_start`, add-player, client-leave, state, and end-test flow against real StudioTestService multiplayer peers |
+| `micro-profiler-units-and-state.mjs` | `capture_micro_profiler` converts MicroProfiler ticks with the capture clock (a measured 5 ms scope reports about 5 ms), analyzes only frames recorded during the capture, records a capture longer than Studio's live MicroProfiler history whole, and leaves capture paused or recording as it found it. Drives capture through a staged copy of LibMP (`lib/micro-profiler-libmp-probe.mjs`) |
+| `micro-profiler-recording.mjs` | Under a scope load that leaves Studio's live history about 13 frames, a 5 s `capture_micro_profiler` still analyzes about 5 s from a streamed recording; `action=start`/`stop` record around work triggered by other calls; `action=analyze` re-reads the saved capture; a client capture crosses the client broker in chunks |
+| `micro-profiler-state-verification.mjs` | Diagnostic, opt-in: records engine MicroProfiler behavior on a solo server and a multiplayer client (default capture state, what `EnableProfiler`/`EnableCapture` change, `SetFrameLimit` semantics, counter history, frame latency). Records facts and fails only if an experiment cannot run |
+| `micro-profiler-recording-verification.mjs` | Diagnostic, opt-in: records how much history a capture can reach on a solo server and client under a scope load: live-snapshot retention, `SetMemTargetMB`, and LibMP memory and file streams (frames, continuity, size). Records facts and fails only if an experiment cannot run |
+| `micro-profiler-friction-verification.mjs` | Diagnostic, opt-in: in a solo playtest, compares the client's measured RenderStepped rate with the frames a server capture shows Studio presenting (`Render/Present`), and copies a ~30 MB client capture back under a scope load to check the client Peer survives. Records facts and fails only if an experiment cannot run |
+| `client-broker-transfer-repro.mjs` | Diagnostic, opt-in: copies 1 MiB RemoteFunction answers from the client back to back, as the client broker copies a capture or screenshot, and reports whether the client is dropped. In a busy game's solo playtest (run it against that open Studio with `MCP_INSTANCE_ID` and `REPRO_USE_RUNNING_PLAYTEST=1`) the client drops after about 40 s with `QUIC: 1 (Internal Error)`; idling as long as each call took does not. The Baseplate does not reproduce it. Records facts and fails only if an experiment cannot run |
 
 ## Lifecycle and cleanup
 

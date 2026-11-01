@@ -1,3 +1,14 @@
+/**
+ * Roblox's per-call Create Asset size limits: 20 MB, except Video at 3.75 GB.
+ * https://create.roblox.com/docs/en-us/cloud/guides/usage-assets.md
+ */
+export const OPEN_CLOUD_ASSET_UPLOAD_LIMIT_BYTES = 20 * 1024 * 1024;
+export const OPEN_CLOUD_VIDEO_UPLOAD_LIMIT_BYTES = 3.75 * 1024 * 1024 * 1024;
+
+export function openCloudAssetUploadLimitBytes(assetType: string): number {
+  return assetType === 'Video' ? OPEN_CLOUD_VIDEO_UPLOAD_LIMIT_BYTES : OPEN_CLOUD_ASSET_UPLOAD_LIMIT_BYTES;
+}
+
 export interface OpenCloudConfig {
   apiKey?: string;
   baseUrl?: string;
@@ -94,6 +105,14 @@ export interface AssetUploadRequest {
       groupId?: string;
     };
   };
+}
+
+/** Lets a caller tell an upload that never left from one Roblox accepted. */
+export interface AssetUploadProgress {
+  /** Called just before the create request is sent. */
+  onSending?: () => void;
+  /** Called when Open Cloud accepts the create request as a long-running operation. */
+  onAccepted?: (operationPath: string) => void;
 }
 
 export interface AssetOperationResponse {
@@ -246,6 +265,172 @@ function normalizeMonetizationItem(
   };
 }
 
+export const EXPERIENCE_DEVICES = ['desktop', 'mobile', 'tablet', 'console', 'vr'] as const;
+export type ExperienceDevice = (typeof EXPERIENCE_DEVICES)[number];
+
+export const SOCIAL_LINK_KINDS = [
+  'facebook', 'twitter', 'youtube', 'twitch', 'discord', 'roblox_group', 'guilded',
+] as const;
+export type SocialLinkKind = (typeof SOCIAL_LINK_KINDS)[number];
+
+export interface SocialLink {
+  title: string;
+  uri: string;
+}
+
+/** A universe (experience) as Open Cloud v2 reports it. */
+export interface ExperienceUniverse {
+  id: number;
+  displayName: string;
+  description: string;
+  /** PUBLIC or PRIVATE. */
+  visibility: string;
+  ownerUserId: number | null;
+  ownerGroupId: number | null;
+  ageRating: string;
+  voiceChatEnabled: boolean;
+  /** Null when private servers are off. */
+  privateServerPriceRobux: number | null;
+  devices: Record<ExperienceDevice, boolean>;
+  socialLinks: Partial<Record<SocialLinkKind, SocialLink>>;
+  rootPlaceId: number | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+/** Universe fields sent to Roblox; null clears a private server price or social link. */
+export interface ExperienceUniverseChanges {
+  voiceChatEnabled?: boolean;
+  privateServerPriceRobux?: number | null;
+  devices?: Partial<Record<ExperienceDevice, boolean>>;
+  socialLinks?: Partial<Record<SocialLinkKind, SocialLink | null>>;
+}
+
+export interface ExperiencePlace {
+  id: number;
+  universeId: number;
+  displayName: string;
+  description: string;
+  serverSize: number | null;
+  root: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface ExperiencePlaceChanges {
+  displayName?: string;
+  description?: string;
+  serverSize?: number;
+}
+
+const DEVICE_FIELDS: Record<ExperienceDevice, string> = {
+  desktop: 'desktopEnabled',
+  mobile: 'mobileEnabled',
+  tablet: 'tabletEnabled',
+  console: 'consoleEnabled',
+  vr: 'vrEnabled',
+};
+
+const SOCIAL_LINK_FIELDS: Record<SocialLinkKind, string> = {
+  facebook: 'facebookSocialLink',
+  twitter: 'twitterSocialLink',
+  youtube: 'youtubeSocialLink',
+  twitch: 'twitchSocialLink',
+  discord: 'discordSocialLink',
+  roblox_group: 'robloxGroupSocialLink',
+  guilded: 'guildedSocialLink',
+};
+
+// Open Cloud v2 names resources by path, such as users/123 or universes/1/places/2.
+function trailingId(path: unknown): number | null {
+  return typeof path === 'string' ? positiveSafeInteger(path.split('/').pop()) ?? null : null;
+}
+
+function optionalText(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function timestamps(value: unknown): { createdAt?: string; updatedAt?: string } {
+  const createdAt = readField(value, 'createTime');
+  const updatedAt = readField(value, 'updateTime');
+  return {
+    ...(typeof createdAt === 'string' ? { createdAt } : {}),
+    ...(typeof updatedAt === 'string' ? { updatedAt } : {}),
+  };
+}
+
+function normalizeUniverse(universeId: number, value: unknown): ExperienceUniverse {
+  const price = readField(value, 'privateServerPriceRobux');
+  const devices = Object.fromEntries(
+    EXPERIENCE_DEVICES.map((device) => [device, readField(value, DEVICE_FIELDS[device]) === true]),
+  ) as Record<ExperienceDevice, boolean>;
+  const socialLinks: Partial<Record<SocialLinkKind, SocialLink>> = {};
+  for (const kind of SOCIAL_LINK_KINDS) {
+    const link = readField(value, SOCIAL_LINK_FIELDS[kind]);
+    const uri = readField(link, 'uri');
+    if (typeof uri === 'string' && uri) socialLinks[kind] = { title: optionalText(readField(link, 'title')), uri };
+  }
+  return {
+    id: trailingId(readField(value, 'path')) ?? universeId,
+    displayName: optionalText(readField(value, 'displayName')),
+    description: optionalText(readField(value, 'description')),
+    visibility: optionalText(readField(value, 'visibility')),
+    ownerUserId: trailingId(readField(value, 'user')),
+    ownerGroupId: trailingId(readField(value, 'group')),
+    ageRating: optionalText(readField(value, 'ageRating')),
+    voiceChatEnabled: readField(value, 'voiceChatEnabled') === true,
+    privateServerPriceRobux: typeof price === 'number' && Number.isSafeInteger(price) && price >= 0 ? price : null,
+    devices,
+    socialLinks,
+    rootPlaceId: trailingId(readField(value, 'rootPlace')),
+    ...timestamps(value),
+  };
+}
+
+function normalizePlace(universeId: number, placeId: number, value: unknown): ExperiencePlace {
+  const serverSize = positiveSafeInteger(readField(value, 'serverSize'));
+  return {
+    id: trailingId(readField(value, 'path')) ?? placeId,
+    universeId,
+    displayName: optionalText(readField(value, 'displayName')),
+    description: optionalText(readField(value, 'description')),
+    serverSize: serverSize ?? null,
+    root: readField(value, 'root') === true,
+    ...timestamps(value),
+  };
+}
+
+// A field named in updateMask but absent from the body is cleared, which is
+// the only way Open Cloud lets a caller remove a price or social link.
+function universePatch(changes: ExperienceUniverseChanges): { body: Record<string, unknown>; updateMask: string[] } {
+  const body: Record<string, unknown> = {};
+  const updateMask: string[] = [];
+  const set = (field: string, value: unknown) => {
+    updateMask.push(field);
+    if (value !== null) body[field] = value;
+  };
+  if (changes.voiceChatEnabled !== undefined) set('voiceChatEnabled', changes.voiceChatEnabled);
+  if (changes.privateServerPriceRobux !== undefined) set('privateServerPriceRobux', changes.privateServerPriceRobux);
+  for (const device of EXPERIENCE_DEVICES) {
+    const enabled = changes.devices?.[device];
+    if (enabled !== undefined) set(DEVICE_FIELDS[device], enabled);
+  }
+  for (const kind of SOCIAL_LINK_KINDS) {
+    const link = changes.socialLinks?.[kind];
+    if (link !== undefined) set(SOCIAL_LINK_FIELDS[kind], link);
+  }
+  return { body, updateMask };
+}
+
+function placePatch(changes: ExperiencePlaceChanges): { body: Record<string, unknown>; updateMask: string[] } {
+  const body: Record<string, unknown> = {
+    ...(changes.displayName !== undefined ? { displayName: changes.displayName } : {}),
+    ...(changes.description !== undefined ? { description: changes.description } : {}),
+    ...(changes.serverSize !== undefined ? { serverSize: changes.serverSize } : {}),
+  };
+  return { body, updateMask: Object.keys(body) };
+}
+
 type AssetDeliveryResponse = {
   location?: string;
   errors?: Array<{
@@ -298,6 +483,51 @@ export class OpenCloudRequestError extends Error {
     super(message);
     this.name = 'OpenCloudRequestError';
   }
+}
+
+/**
+ * A long-running Open Cloud asset operation that finished without an asset:
+ * either Roblox reported an operation error, or it completed with no asset ID.
+ */
+export class OpenCloudOperationError extends Error {
+  constructor(
+    readonly providerMessage: string,
+    readonly operationPath: string,
+    readonly providerCode?: number,
+    /** The operation reported no error, only no asset ID; the asset may exist. */
+    readonly completedWithoutAsset = false,
+  ) {
+    super(`Asset upload failed: ${providerMessage} (operation ${operationPath})`);
+    this.name = 'OpenCloudOperationError';
+  }
+}
+
+/**
+ * Returns the finished operation, undefined while it is still running, or
+ * throws when Roblox reports a terminal error. Errors are checked before done:
+ * a failed operation is also done.
+ */
+function finishedAssetOperation(
+  operation: AssetOperationResponse,
+  fallbackPath: string,
+): AssetOperationResponse | undefined {
+  const operationPath = typeof operation.path === 'string' && operation.path ? operation.path : fallbackPath;
+  const error: unknown = readField(operation, 'error');
+  if (error !== undefined && error !== null) {
+    const code = readField(error, 'code');
+    const message = readField(error, 'message');
+    throw new OpenCloudOperationError(
+      typeof message === 'string' && message ? message : 'Open Cloud reported an unspecified operation error.',
+      operationPath,
+      typeof code === 'number' ? code : undefined,
+    );
+  }
+  if (operation.done !== true) return undefined;
+  const assetId: unknown = readField(operation.response, 'assetId');
+  if ((typeof assetId !== 'string' || !assetId) && typeof assetId !== 'number') {
+    throw new OpenCloudOperationError('Open Cloud operation completed without an asset ID.', operationPath, undefined, true);
+  }
+  return operation;
 }
 
 async function openCloudResponseError(response: Response): Promise<OpenCloudRequestError> {
@@ -543,6 +773,33 @@ export class OpenCloudClient {
     });
   }
 
+  async getUniverse(universeId: number): Promise<ExperienceUniverse> {
+    return normalizeUniverse(universeId, await this.request<unknown>(`/cloud/v2/universes/${universeId}`));
+  }
+
+  async updateUniverse(universeId: number, changes: ExperienceUniverseChanges): Promise<void> {
+    const { body, updateMask } = universePatch(changes);
+    await this.request<unknown>(`/cloud/v2/universes/${universeId}`, {
+      method: 'PATCH',
+      params: { updateMask: updateMask.join(',') },
+      body,
+    });
+  }
+
+  async getPlace(universeId: number, placeId: number): Promise<ExperiencePlace> {
+    const path = `/cloud/v2/universes/${universeId}/places/${placeId}`;
+    return normalizePlace(universeId, placeId, await this.request<unknown>(path));
+  }
+
+  async updatePlace(universeId: number, placeId: number, changes: ExperiencePlaceChanges): Promise<void> {
+    const { body, updateMask } = placePatch(changes);
+    await this.request<unknown>(`/cloud/v2/universes/${universeId}/places/${placeId}`, {
+      method: 'PATCH',
+      params: { updateMask: updateMask.join(',') },
+      body,
+    });
+  }
+
   async getAssetThumbnail(
     assetId: number,
     size: '150x150' | '420x420' | '768x432' = '420x420'
@@ -717,7 +974,8 @@ export class OpenCloudClient {
   async createAsset(
     uploadRequest: AssetUploadRequest,
     fileContent: Buffer,
-    fileName: string
+    fileName: string,
+    progress: AssetUploadProgress = {},
   ): Promise<AssetOperationResponse> {
     const formData = new FormData();
     formData.append('request', JSON.stringify(uploadRequest));
@@ -727,12 +985,25 @@ export class OpenCloudClient {
       fileName
     );
 
+    // The create request is never retried; only the status poll repeats.
+    progress.onSending?.();
     const operation = await this.requestMultipart<AssetOperationResponse>(
       '/assets/v1/assets',
       formData
     );
-    if (operation.done) return operation;
-    return this.pollOperation(operation.path);
+    const operationPath = typeof operation.path === 'string' ? operation.path : '';
+    const finished = finishedAssetOperation(operation, operationPath || '(unknown operation)');
+    if (finished) return finished;
+    if (!operationPath) {
+      throw new Error('Asset upload response did not include an operation path.');
+    }
+    progress.onAccepted?.(operationPath);
+    return this.pollOperation(operationPath);
+  }
+
+  /** Continues polling an asset operation Open Cloud already accepted. */
+  resumeAssetOperation(operationPath: string): Promise<AssetOperationResponse> {
+    return this.pollOperation(operationPath);
   }
 
   private getMimeType(fileName: string): string {
@@ -824,11 +1095,13 @@ export class OpenCloudClient {
       const result = await this.request<AssetOperationResponse>(
         `/assets/v1/operations/${operationId}`
       );
-      if (result.done) return result;
-      if (result.error) {
-        throw new Error(`Asset upload failed: ${result.error.message}`);
+      const finished = finishedAssetOperation(result, operationPath);
+      if (finished) return finished;
+      if (i < maxAttempts - 1) {
+        const { promise, resolve } = Promise.withResolvers<void>();
+        setTimeout(resolve, intervalMs);
+        await promise;
       }
-      await new Promise(resolve => setTimeout(resolve, intervalMs));
     }
     throw new Error(
       `Asset upload timed out after ${(maxAttempts * intervalMs) / 1000}s. Operation ID: ${operationId}`

@@ -7,7 +7,7 @@ import { WebSocketServer } from 'ws';
 import { toNodeHandler } from '@modelcontextprotocol/node';
 import { MAX_SCRIPT_EDITS, RobloxStudioTools } from './tools/index.js';
 import type { ScriptEdit } from './tools/index.js';
-import { BridgeService, isValidOperationId, MAX_OPERATION_WAIT_MS, MultiplayerGroupInUseError, RequestFailure, RoutingFailure } from './bridge-service.js';
+import { BridgeService, isValidOperationId, MAX_OPERATION_WAIT_MS, MultiplayerGroupInUseError, PRIMARY_PROXY_FEATURES, RequestFailure, RoutingFailure } from './bridge-service.js';
 import type { PublicStudioInstance, PublicStudioPeer, RegisterPeerResult } from './bridge-service.js';
 import type { ToolDefinition } from './tools/definitions.js';
 import { createToolHttpHandler, normalizeToolResult, publicToolErrorBody } from './mcp-runtime.js';
@@ -74,7 +74,7 @@ const TOOL_PROXY_ENDPOINTS: Record<string, readonly string[]> = {
   ],
   get_runtime_logs: ['/api/get-runtime-logs'],
   capture_script_profiler: ['/api/capture-script-profiler'],
-  capture_micro_profiler: ['/api/capture-micro-profiler'],
+  capture_micro_profiler: ['/api/capture-micro-profiler', '/api/micro-profiler-read', '/api/micro-profiler-release'],
   breakpoints: ['/api/breakpoints'],
   insert_asset: ['/api/insert-asset'],
   generate_model: ['/api/generate-model'],
@@ -87,7 +87,10 @@ const TOOL_PROXY_ENDPOINTS: Record<string, readonly string[]> = {
   export_rbxm: ['/api/export-rbxm'],
   import_rbxm: ['/api/import-rbxm'],
   find_and_replace_in_scripts: ['/api/find-and-replace-in-scripts'],
+  get_simulation_state: ['/api/get-network-simulation-state', '/api/get-device-simulator-state'],
+  get_device_simulator_state: ['/api/get-device-simulator-state'],
   manage_monetization: ['/api/place-info'],
+  manage_experience: ['/api/place-info'],
 };
 
 type PassiveStudioPeer = Omit<PublicStudioPeer, 'peerId'>;
@@ -233,7 +236,10 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   }, body.instance_id),
   get_instance_properties: (tools, body) => tools.getInstanceProperties(body.instancePath, body.excludeSource, body.instance_id),
   get_project_structure: (tools, body) => tools.getProjectStructure(body.path, body.maxDepth, body.scriptsOnly, body.instance_id),
-  set_properties: (tools, body) => tools.setProperties(body.instancePath, body.properties, body.instance_id, body.operation_id),
+  set_properties: (tools, body) => tools.setProperties(body.instancePath, body.properties, body.instance_id, body.operation_id, {
+    atomic: body.atomic,
+    dryRun: body.dryRun,
+  }),
   grep_scripts: (tools, body, context) => tools.grepScripts(body.pattern, {
     caseSensitive: body.caseSensitive,
     usePattern: body.usePattern,
@@ -248,21 +254,23 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
     const { startLine, endLine } = optionalLineRange(body, 'get_script_source');
     return tools.getScriptSource(body.instancePath, startLine, endLine, body.instance_id);
   },
-  set_script_source: (tools, body) => tools.setScriptSource(body.instancePath, body.source, body.instance_id),
+  set_script_source: (tools, body) => tools.setScriptSource(body.instancePath, body.source, body.instance_id, body.operation_id, body.expected_revision),
   edit_script_lines: (tools, body) => tools.editScriptLines(body.instancePath, scriptEditsFromBody(body), {
     expectedRevision: body.expected_revision,
     dryRun: body.dry_run,
   }, body.instance_id, body.operation_id),
-  insert_script_lines: (tools, body) => tools.insertScriptLines(body.instancePath, body.afterLine, body.newContent, body.instance_id),
+  insert_script_lines: (tools, body) => tools.insertScriptLines(
+    body.instancePath, body.afterLine, body.newContent, body.instance_id, body.operation_id, body.expected_revision,
+  ),
   delete_script_lines: (tools, body) => {
     const { startLine, endLine } = requiredClosedLineRange(body, 'delete_script_lines');
-    return tools.deleteScriptLines(body.instancePath, startLine, endLine, body.instance_id);
+    return tools.deleteScriptLines(body.instancePath, startLine, endLine, body.instance_id, body.operation_id, body.expected_revision);
   },
   get_attributes: (tools, body) => tools.getAttributes(body.instancePath, body.instance_id),
   selection: (tools, body) => tools.selection(body.action, body, body.instance_id),
   execute_luau: (tools, body) => tools.executeLuau(body.code, body.target, body.instance_id, body.operation_id),
-  eval_server_runtime: (tools, body) => tools.evalServerRuntime(body.code, body.instance_id),
-  eval_client_runtime: (tools, body) => tools.evalClientRuntime(body.code, body.target, body.instance_id),
+  eval_server_runtime: (tools, body) => tools.evalServerRuntime(body.code, body.instance_id, body.operation_id),
+  eval_client_runtime: (tools, body) => tools.evalClientRuntime(body.code, body.target, body.instance_id, body.operation_id),
   set_network_profile: (tools, body) => tools.setNetworkProfile(body.profile, body.target, body.overrides, body.instance_id),
   get_simulation_state: (tools, body) => tools.getSimulationState(body.include, body.target, body.instance_id),
   reset_simulation_state: (tools, body) => tools.resetSimulationState(body.target, body.network, body.deviceSimulator, body.instance_id),
@@ -271,6 +279,7 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   capture_device_matrix: (tools, body) => tools.captureDeviceMatrix(body.entries, body.target, body.format, body.quality, body.settleSeconds, body.restoreAfter, body.instance_id),
   manage_instance: (tools, body) => tools.manageInstance(body),
   manage_monetization: (tools, body) => tools.manageMonetization(body, body.instance_id),
+  manage_experience: (tools, body) => tools.manageExperience(body, body.instance_id),
   solo_playtest: (tools, body) => tools.soloPlaytest(body.action, body.mode, body.timeout, body.instance_id),
   multiplayer_playtest: (tools, body) => tools.multiplayerPlaytest(body.action, body.numPlayers, body.target, body.testArgs, body.value, body.timeout, body.instance_id),
   get_runtime_logs: (tools, body, context) => tools.getRuntimeLogs(body.instance_id, body.multiplayer_group_id, body.cursor, body.cursor_by_instance, body.tail, body.filter, context?.signal),
@@ -285,23 +294,28 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
     output_path: body.output_path,
   }, body.instance_id),
   capture_micro_profiler: (tools, body) => tools.captureMicroProfiler(body.target, {
+    action: body.action,
     duration_ms: body.duration_ms,
+    input_path: body.input_path,
     focus: body.focus,
     filter: body.filter,
     max_timers: body.max_timers,
     min_total_us: body.min_total_us,
     include_idle: body.include_idle,
     include_gpu: body.include_gpu,
-    max_events: body.max_events,
-    frame_window: body.frame_window,
+    spike_frames: body.spike_frames,
+    start_frame: body.start_frame,
+    end_frame: body.end_frame,
     max_groups: body.max_groups,
     max_timers_per_group: body.max_timers_per_group,
+    max_related_timers: body.max_related_timers,
     summary_output_path: body.summary_output_path,
     baseline_path: body.baseline_path,
     baseline: body.baseline,
     baseline_label: body.baseline_label,
     current_label: body.current_label,
     max_comparison_rows: body.max_comparison_rows,
+    include_comparison_index: body.include_comparison_index,
     output_path: body.output_path,
   }, body.instance_id),
   breakpoints: (tools, body) => tools.breakpoints(body.action, body, body.target, body.instance_id),
@@ -313,7 +327,7 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   search_assets: (tools, body) => tools.searchAssets(body.assetType, body.query, body.maxResults, body.sortBy, body.robloxCreatedOnly),
   get_asset_details: (tools, body) => tools.getAssetDetails(body.assetId),
   get_asset_thumbnail: (tools, body) => tools.getAssetThumbnail(body.assetId, body.size),
-  insert_asset: (tools, body) => tools.insertAsset(body.assetId, body.parentPath, body.position, body.instance_id),
+  insert_asset: (tools, body) => tools.insertAsset(body.assetId, body.parentPath, body.position, body.instance_id, body.operation_id),
   generate_model: (tools, body) => tools.generateModel(body, body.instance_id),
   preview_asset: (tools, body) => tools.previewAsset(
     body.assetId,
@@ -330,7 +344,9 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
   get_memory_breakdown: (tools, body) => tools.getMemoryBreakdown(body.target, body.tags, body.instance_id),
   get_scene_analysis: (tools, body) => tools.getSceneAnalysis(body.mode, body.target, body.topN, body.raw, body.instance_id),
   export_rbxm: (tools, body) => tools.exportRbxm(body.instance_paths, body.output_path, body.target, body.instance_id),
-  import_rbxm: (tools, body, context) => tools.importRbxm(body.source, body.parent_path, body.target, body.instance_id, context?.signal),
+  import_rbxm: (tools, body, context) => tools.importRbxm(
+    body.source, body.parent_path, body.target, body.instance_id, context?.signal, body.operation_id,
+  ),
   find_and_replace_in_scripts: (tools, body) => tools.findAndReplaceInScripts(body.pattern, body.replacement, {
     caseSensitive: body.caseSensitive,
     usePattern: body.usePattern,
@@ -338,7 +354,8 @@ export const TOOL_HANDLERS: Record<string, ToolHandler> = {
     classFilter: body.classFilter,
     dryRun: body.dryRun,
     maxReplacements: body.maxReplacements,
-  }, body.instance_id),
+    expectedRevisions: body.expected_revisions,
+  }, body.instance_id, body.operation_id),
 };
 
 const MAX_STUDIO_SESSIONS = 256;
@@ -926,6 +943,7 @@ export function createHttpServer(tools: RobloxStudioTools, bridge: BridgeService
     res.json({
       ...bridge.getTopologySnapshot(),
       serverVersion: serverConfig?.version,
+      proxyFeatures: PRIMARY_PROXY_FEATURES,
     });
   });
 
