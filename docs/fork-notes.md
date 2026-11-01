@@ -1,6 +1,6 @@
 # dallen fork notes
 
-This is Daniel's fork of [Chrrxs/robloxstudio-mcp](https://github.com/Chrrxs/robloxstudio-mcp) (MIT), branched from upstream `main` at v3.2.1 (`90e49b9`). Work lives on the `daniel/main` branch of [dallen2021/robloxstudio-mcp](https://github.com/dallen2021/robloxstudio-mcp/tree/daniel/main). Fork versions carry a suffix: **`3.2.1-dallen.1`**. The server and the Studio plugin must be the same build (the plugin's `/ready` handshake rejects a version mismatch), so both are built from this checkout and nothing is ever fetched from npm or GitHub releases.
+This is Daniel's fork of [Chrrxs/robloxstudio-mcp](https://github.com/Chrrxs/robloxstudio-mcp) (MIT), branched from upstream `main` at v3.2.1 (`90e49b9`) and last synced with v3.4.2 (`3efee60`, 2026-11-01). Work lives on the `daniel/main` branch of [dallen2021/robloxstudio-mcp](https://github.com/dallen2021/robloxstudio-mcp/tree/daniel/main). Fork versions carry a suffix: **`3.4.2-dallen.1`**. The server and the Studio plugin must be the same build (the plugin's `/ready` handshake rejects a version mismatch), so both are built from this checkout and nothing is ever fetched from npm or GitHub releases.
 
 Why the fork exists: several AI agents (Claude Code, Codex) share one Mac and one Studio install. Each agent runs its own stdio server; upstream lets any of them address any open place by `instance_id`. The evaluation that led here is `docs/handoffs/robloxstudio-mcp-evaluation-2026-10-18.md` in the RobloxDev workspace.
 
@@ -48,7 +48,7 @@ cd /Users/daniel/Desktop/RobloxDev/robloxstudio-mcp-fork
 npm ci --ignore-scripts                      # root workspaces
 npm --prefix studio-plugin ci --ignore-scripts
 npm run build                                # server: packages/*/dist
-npm run build:plugin:artifact                # plugin: studio-plugin/MCPPlugin.rbxmx (3.2.1-dallen.1), no install
+npm run build:plugin:artifact                # plugin: studio-plugin/MCPPlugin.rbxmx (3.4.2-dallen.1), no install
 npm test -w packages/core                    # unit tests
 mkdir -p ~/Documents/Roblox/plugin-backups && cp -Rp ~/Documents/Roblox/Plugins ~/Documents/Roblox/plugin-backups/Plugins-$(date -u +%Y%m%dT%H%M%SZ)   # back up first
 node packages/robloxstudio-mcp/dist/index.js --install-bundled-plugin   # -> ~/Documents/Roblox/Plugins/MCPPlugin.rbxmx
@@ -67,17 +67,25 @@ The first process binds `127.0.0.1:58741` (primary); later ones run in proxy mod
 
 ## Bumping the fork version
 
-Change `"version"` in `package.json`, `packages/core/package.json`, `packages/robloxstudio-mcp/package.json`, `packages/robloxstudio-mcp-inspector/package.json` and the matching `package-lock.json` entries (e.g. `3.2.1-dallen.2`), rebuild both server and plugin, reinstall the plugin, and restart Studio processes and agent sessions. A server and plugin from different builds will refuse to connect.
+Change `"version"` in `package.json`, `packages/core/package.json`, `packages/robloxstudio-mcp/package.json`, `packages/robloxstudio-mcp-inspector/package.json` and the matching `package-lock.json` entries (e.g. `3.4.2-dallen.2`), rebuild both server and plugin, reinstall the plugin, and restart Studio processes and agent sessions. A server and plugin from different builds will refuse to connect.
 
 ## Syncing with upstream
 
+Upstream is [Chrrxs/robloxstudio-mcp](https://github.com/Chrrxs/robloxstudio-mcp), remote `upstream` (push disabled). Never push to it.
+
 ```sh
-git fetch upstream --tags
-git checkout daniel/main
-git merge upstream/main          # or a tag, e.g. v3.3.0; prefer merge over rebase (the branch is pushed)
-# resolve conflicts; the fork's edits are marked "dallen fork" in comments
-# set the version to <upstream>-dallen.1, then build, test, build:plugin:artifact, reinstall as above
-git push origin daniel/main
+npm run sync-upstream -- --check     # how far behind daniel/main is, and the upstream commits
+npm run sync-upstream                # merge the latest release tag (or pass one: -- v3.5.0)
 ```
 
-Never push to `upstream`. Check after each merge: `invoke` in `server.ts` still calls `pinGuard.check`; any new Studio tool has `instance_id` in its schema (the `tool-schema` test enforces this, and `place-pin.test.ts` then covers it); `plugin-installer.ts` still has no download path; `Communication.ts` `checkForUpdates` is still a no-op; `/health` still redacts.
+`scripts/sync-upstream.sh` works in its own worktree (`/tmp/rsmcp-sync-<tag>`, branch `sync/upstream-<tag>` from `origin/daniel/main`), so the live checkout and its `dist/` are never touched. It merges, resolves version-only conflicts to `<tag>-dallen.1`, commits, then runs `npm run verify-fork`: `npm ci`, build, typecheck, the full `npm test`, `scripts/mcp-smoke.mjs` (initialize and tools/list on a private port with a throwaway token and a required pin, so no Studio attaches) and the plugin artifact build. Any other conflict stops it with the file list; resolve by keeping the edits marked `dallen fork`, commit, and run `npm run verify-fork` in the worktree.
+
+After it passes:
+
+1. Check the patch list below by hand, then `git diff upstream/<tag>` should show only our patch (about 25 files).
+2. `git push -u origin sync/upstream-<tag>`, then fast-forward `daniel/main` to it and push.
+3. Deploying is separate, and changes the server every agent runs: in the live checkout, `git pull`, `npm ci --ignore-scripts`, `npm run build`, `npm run build:plugin:artifact`, back up and reinstall the plugin (see [Build and install](#build-and-install)), then restart Studio processes and agent sessions together. A server and plugin from different builds refuse to connect.
+
+Patch checklist after each merge: `invoke` in `server.ts` still calls `pinGuard.check`; any new Studio tool has `instance_id` in its schema (the `tool-schema` test enforces this, and `place-pin.test.ts` then covers it); `plugin-installer.ts` still has no download path; `Communication.ts` `checkForUpdates` is still a no-op; `/health` still redacts; the catalog budgets in `mcp-runtime.test.ts` stay upstream's plus about 2,000 characters for our three tools.
+
+Known conflict spots: the four `package.json` versions and `package-lock.json` (handled by the script), the catalog counts and budgets in `mcp-runtime.test.ts`, and the imports in `mcp-runtime.ts`.

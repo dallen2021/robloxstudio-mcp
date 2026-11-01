@@ -1,4 +1,8 @@
-> **dallen fork (3.2.1-dallen.1):** per-agent place pinning, token-gated `/health`, macOS close refusal, read-only DataStore tools, local-only version-pinned plugin install. See [docs/fork-notes.md](docs/fork-notes.md) for what changed, install, pinning and upstream sync.
+> **dallen fork (3.4.2-dallen.1)** of [Chrrxs/robloxstudio-mcp](https://github.com/Chrrxs/robloxstudio-mcp). Details: [docs/fork-notes.md](docs/fork-notes.md).
+>
+> **Upstream:** `https://github.com/Chrrxs/robloxstudio-mcp` (remote `upstream`, push disabled), last synced at v3.4.2. Sync with `npm run sync-upstream -- --check` to see what is new, then `npm run sync-upstream` to merge the latest release into a `sync/upstream-<tag>` branch in its own worktree and run the build, the tests, an offline MCP smoke test and the plugin build. Deploying is a separate step (see the fork notes).
+>
+> **Our patches:** per-agent place pinning (`pin_place`, `ROBLOX_STUDIO_PLACE`, `ROBLOX_STUDIO_REQUIRE_PIN`); token-gated `/health` detail; macOS `manage_instance close` refuses cleanly; read-only DataStore tools (`read_datastore`, `list_datastore_keys`); local-only, version-pinned plugin install with no update check; the sync and smoke scripts.
 
 # Roblox Studio MCP
 
@@ -23,7 +27,7 @@ screenshots, memory reports, and profiler captures from each peer.
 
 ### Find performance problems
 
-- Record server or client CPU timings with `capture_script_profiler` and `capture_micro_profiler`.
+- Record server or client CPU timings with `capture_script_profiler` and `capture_micro_profiler`. MicroProfiler captures are saved for re-analysis, and `capture_micro_profiler` also analyzes `.gprx` dumps from Studio's MicroProfiler.
 - Break down memory use with `get_memory_breakdown` or attribute scene cost with `get_scene_analysis`.
 
 ### Work in edit mode
@@ -43,6 +47,10 @@ screenshots, memory reports, and profiler captures from each peer.
 ### Manage monetization
 
 - List, create, and update developer products and game passes with `manage_monetization`. New items stay off sale unless you ask, and a name that already exists is refused because Roblox cannot delete these items. Requires an Open Cloud API key; see [Configuration](docs/configuration.md#environment-variables).
+
+### Manage experience settings
+
+- Read and change the experience title, description, server size, devices, voice chat, private server price, and social links with `manage_experience`. Private server price changes need `confirm`, which the agent sets itself, so it is not a human approval step. It cannot make an experience public or private: Open Cloud ignores visibility changes, and Roblox can refuse to make an experience public through an API key, so change visibility in Creator Hub. The agent can use every permission the key grants, so give the key only the scopes you want an agent to use. Requires an Open Cloud API key; see [Configuration](docs/configuration.md#environment-variables).
 
 ### Look up Roblox APIs
 
@@ -146,7 +154,8 @@ Read-only access to the DataModel.
 
 No DataModel or script edits. The selection tool can change editor selection and
 camera framing; export and profiler tools can write files only to explicit local
-paths.
+paths, except that `capture_micro_profiler` keeps its 10 most recent captures in
+the system temp directory.
 
 Install only one variant at a time (the installers remove the other automatically):
 
